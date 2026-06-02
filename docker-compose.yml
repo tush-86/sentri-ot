@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  sentri-ot:
+    build: .
+    image: sentri-ot:latest
+    container_name: sentri-ot
+    restart: unless-stopped
+    # Host networking is required for BACnet/IP UDP broadcast visibility;
+    # port 8000 is exposed directly on the host network.
+    environment:
+      - SENTRI_OT_SCAN_MODE=${SENTRI_OT_SCAN_MODE:-passive}
+      - SENTRI_OT_SCAN_NETWORKS=${SENTRI_OT_SCAN_NETWORKS:-}
+      - SENTRI_OT_SCAN_INTERVAL=${SENTRI_OT_SCAN_INTERVAL:-60}
+      - SENTRI_OT_CORS_ORIGINS=${SENTRI_OT_CORS_ORIGINS:-http://localhost:5173,http://localhost:8000}
+      - SENTRI_OT_DB_PATH=${SENTRI_OT_DB_PATH:-/data/sentri_ot.db}
+      - SENTRI_OT_API_KEY=${SENTRI_OT_API_KEY:-}
+    volumes:
+      - sentri-ot-data:/data
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  sentri-ot-data:

@@ -1,0 +1,19 @@
+# Sentri OT Backend — Deployment-ready dependencies
+# Unpinned = allow up-to-date; pinned loosely for stability.
+
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+
+# PDF report generation (fpdf2 package, imports as fpdf)
+fpdf2>=2.8.0
+
+# BACnet communication — legacy and modern
+bacpypes>=0.19.0
+bacpypes3>=0.0.100
+
+# Async SQLite persistence
+aiosqlite>=0.21.0
+
+# Optional: Modbus TCP (not needed for passive mode)
+# pymodbus>=3.9.0
