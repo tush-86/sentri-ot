@@ -818,15 +818,24 @@ def _enrich_assets_sync(
     """
     local_ip = _local_bacnet_ip()
     enriched: dict[int, dict[str, Any]] = {}
+    sock: socket.socket | None = None
 
-    try:
-        # Use ephemeral port to avoid conflicts
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((local_ip, 0))
-        sock.settimeout(0.25)
-    except OSError:
+    # Windows may reject binding to a specific IP; fall back to auto
+    for bind_ip in (local_ip, "0.0.0.0", ""):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((bind_ip, 0) if bind_ip else ("", 0))
+            s.settimeout(0.25)
+            actual_ip, actual_port = s.getsockname()[:2]
+            print(f"[Sentri] Enrichment socket bound on {actual_ip}:{actual_port}")
+            sock = s
+            break
+        except OSError:
+            continue
+    if sock is None:
+        print("[Sentri] Enrichment socket bind failed — skipping ReadProperty")
         return enriched
 
     try:
