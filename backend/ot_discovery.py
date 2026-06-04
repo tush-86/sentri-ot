@@ -273,41 +273,21 @@ def _build_read_property_request(
     object_type: int = BACNET_OBJECT_DEVICE,
     invoke_id: int = 1,
 ) -> bytes:
-    """Build a BACnet ReadProperty Confirmed-Request PDU.
-
-    Returns a complete BVLC + NPDU + APDU byte string ready to send via UDP.
-
-    APDU structure (Confirmed-Request):
-      PDU type=0 (confirmed-req), SEG=0, MOR=0, SA=1  → 0x01
-      Max segments accepted  → 0x02
-      Max APDU accepted      → 0x05 0xC4 (1476, matching discovery)
-      Invoke ID              → 1 byte
-      Service choice ReadProperty → 0x0C
-      Object Identifier (context tag 0, length 4)  → 0x0C + 4 bytes
-      Property Identifier (context tag 1, length 1) → 0x19 + 1 byte
-    """
+    """Build a BACnet ReadProperty Confirmed-Request PDU."""
     obj_id = (object_type << 22) | (device_instance & 0x3FFFFF)
 
     apdu = bytes([
-        0x01,            # PDU type conf-req, SA=1
-        0x02,            # max segments = 2
-        0x05, 0xC4,      # max APDU = 1476
-        invoke_id & 0xFF,  # invoke ID
-        0x0C,            # ReadProperty service
-        # Object Identifier: context tag 0, length 4
-        0x0C,
-    ]) + struct.pack("!I", obj_id)
+        0x00,                 # PDU type conf-req, SA=0 (no segmentation)
+        invoke_id & 0xFF,      # invoke ID
+        0x0C,                  # ReadProperty service
+        0x0C,                  # Object Identifier: context tag 0, length 4
+    ]) + struct.pack("!I", obj_id) + bytes([
+        0x19,                  # Property Identifier: context tag 1, length 1
+        property_id & 0xFF,
+    ])
 
-    # Property Identifier: context tag 1
-    # Properties 0-127 fit in one byte; 128-255 also one byte
-    apdu += bytes([0x19, property_id & 0xFF])
-
-    # NPDU: version 1, no dest (local device)
-    npdu = bytes([0x01, 0x00]) + apdu
-
-    # BVLC: Original-Unicast-NPDU
-    bvlc_len = 4 + len(npdu)
-    bvll = struct.pack("!BBH", 0x81, 0x0A, bvlc_len) + npdu
+    body = bytes([0x01, 0x00]) + apdu  # NPDU version 1, no dest
+    bvll = struct.pack("!BBH", 0x81, 0x0A, 4 + len(body)) + body
     return bvll
 
 
@@ -466,6 +446,21 @@ def _read_property_sync(
         sock.settimeout(timeout)
         try:
             data, _ = sock.recvfrom(4096)
+            if len(data) < 10:
+                return None
+            # Quick BVLC sniff: expected type 0x81 func 0x0A
+            if data[0] != 0x81 or data[1] != 0x0A:
+                return None
+            # Check for Error PDU (0x50) vs Complex-ACK (0x30)
+            bvlc_len = int.from_bytes(data[2:4], "big")
+            apdu_start = 4
+            if apdu_start < bvlc_len and apdu_start < len(data):
+                pdu_type = data[apdu_start] >> 4
+                if pdu_type == 0x05:  # Error
+                    err_cls = data[apdu_start + 3] if apdu_start + 3 < len(data) else 0
+                    err_code = data[apdu_start + 4] if apdu_start + 4 < len(data) else 0
+                    if err_cls == 2 and err_code == 1:  # unknown-property
+                        return None  # device doesn't support this property
             return _parse_read_property_ack(data)
         finally:
             sock.settimeout(saved)
@@ -607,19 +602,7 @@ def _read_object_names_sync(
             obj = objects[idx]
             obj_instance = obj["instance"]
             obj_type = obj["object_type"]
-
-            # Build ReadProperty for Object_Name of this specific object
-            obj_id = (obj_type << 22) | (obj_instance & 0x3FFFFF)
-            apdu_req = bytes([
-                0x01, 0x02, 0x05, 0xC4,
-                (0x80 + idx + 1),  # unique invoke ID per request
-                0x0C,
-                0x0C,
-            ]) + struct.pack("!I", obj_id) + bytes([0x19, BACNET_PROP_OBJECT_NAME])
-
-            npdu = bytes([0x01, 0x00]) + apdu_req
-            bvlc_len = 4 + len(npdu)
-            bvll = struct.pack("!BBH", 0x81, 0x0A, bvlc_len) + npdu
+            bvll = _build_read_property_request(obj_instance, BACNET_PROP_OBJECT_NAME, object_type=obj_type, invoke_id=(idx + 2) & 0xFF)
 
             try:
                 sock.sendto(bvll, (ip, 47808))
