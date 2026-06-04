@@ -529,9 +529,9 @@ async def _run_active_scan(progress_cb: Callable[[int, str], None] | None = None
     devices = await _full_bacnet_discovery(timeout=5.0, progress_cb=progress_cb)
     assets = [_build_bacnet_asset(d) for d in devices]
 
-    # Optional lightweight TCP check only when explicitly active/full.
+    # Optional lightweight TCP check only when discovery mode is "full".
     networks = _discover_local_networks()
-    if _get_mode() == "active":
+    if _get_bacnet_discovery() == "full":
         for network in networks:
             # Cap to avoid scanning entire large networks by accident; do not materialize huge networks.
             for idx, ip in enumerate(network.hosts()):
