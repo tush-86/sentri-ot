@@ -277,45 +277,198 @@ BACNET_PROP_VENDOR_NAME = 121
 BACNET_PROP_APPLICATION_SW_VERSION = 12
 
 
-def _build_read_property_request(
+def _build_read_property_multiple_request(
     device_instance: int,
-    property_id: int,
+    property_ids: list[int],
     object_type: int = BACNET_OBJECT_DEVICE,
     invoke_id: int = 1,
 ) -> bytes:
-    """Build a BACnet ReadProperty Confirmed-Request PDU.
+    """Build a BACnet ReadPropertyMultiple Confirmed-Request PDU.
 
-    PDU byte layout (Confirmed-Request, SA=1, SEG=0, MOR=0):
-      bits 7-4 = PDU type 0
-      bit 3   = SEG (0)
-      bit 2   = MOR (0)
-      bit 1   = SA  (1 = segmented response accepted)  ← THIS IS BIT 1, NOT BIT 0
-      bit 0   = reserved (0)
-      → 0x02 (binary 0000 0010)
+    Siemens PXC controllers accept ReadPropertyMultiple (service 0x0E)
+    but reject individual ReadProperty (service 0x0C).
 
-    APDU fields when SA=1 (ref ASHRAE 135-2020 §20.1.2):
-      PDU byte (1) | max-apdu (2, constrained whole number) | invoke-id (1) |
-      service-choice (1) | service-request
-
-    max-segments-accepted is OPTIONAL when SA=1; omit for simpler
-    interop with controllers that reject unknown fields.
+    Service encoding (ASHRAE 135-2020 §15.9):
+      ReadPropertyMultiple-Request ::= SEQUENCE OF ReadAccessSpecification
+      ReadAccessSpecification ::= SEQUENCE {
+        objectIdentifier   [0] BACnetObjectIdentifier,
+        listOfPropertyRefs [1] SEQUENCE OF PropertyReference
+      }
+      PropertyReference ::= SEQUENCE {
+        propertyIdentifier [0] BACnetPropertyIdentifier,
+        propertyArrayIndex [1] Unsigned OPTIONAL
+      }
     """
     obj_id = (object_type << 22) | (device_instance & 0x3FFFFF)
 
-    apdu = bytes([
-        0x02,             # PDU: Confirmed-Request, SA=1  (see docstring)
-        0x05, 0xC4,        # max-apdu = 1476 (constrained whole number, 2 bytes)
-        invoke_id & 0xFF,
-        0x0C,              # ReadProperty service
-        0x0C,              # Object Identifier: context tag 0, length 4
-    ]) + struct.pack("!I", obj_id) + bytes([
-        0x19,              # Property Identifier: context tag 1, length 1
-        property_id & 0xFF,
-    ])
+    # Build service parameters for ReadPropertyMultiple
+    params = bytes([
+        # Opening tag: SEQUENCE OF ReadAccessSpecification (context 0, opening)
+        0x0E,
+        # ReadAccessSpec: Object Identifier (context 0)
+        0x0C,
+    ]) + struct.pack("!I", obj_id)
 
-    body = bytes([0x01, 0x00]) + apdu  # NPDU version 1, no dest
+    # List of PropertyReferences (context 1, opening)
+    params += bytes([0x1E])
+    for prop_id in property_ids:
+        # PropertyReference: propertyIdentifier (context 0, length 1)
+        params += bytes([0x09, prop_id])
+    # List closing (context 1, closing)
+    params += bytes([0x1F])
+    # SEQUENCE closing (context 0, closing)
+    params += bytes([0x0F])
+
+    apdu = bytes([
+        0x02,             # PDU: Confirmed-Request, SA=1
+        0x05, 0xC4,        # max-apdu = 1476
+        invoke_id & 0xFF,
+        0x0E,              # ReadPropertyMultiple service
+    ]) + params
+
+    body = bytes([0x01, 0x00]) + apdu
     bvll = struct.pack("!BBH", 0x81, 0x0A, 4 + len(body)) + body
     return bvll
+
+
+def _parse_read_property_multiple_ack(data: bytes, expected_count: int = 1) -> list[str | int | None]:
+    """Parse Complex-ACK response from ReadPropertyMultiple.
+
+    The response contains a list of ReadAccessResult, each containing
+    values for the requested properties. Returns one value per expected
+    property, or None for failures.
+    """
+    results: list[str | int | None] = [None] * expected_count
+    try:
+        if len(data) < 10 or data[0] != 0x81:
+            return results
+        bvlc_len = int.from_bytes(data[2:4], "big")
+        apdu = data[4:bvlc_len]
+        if len(apdu) < 4:
+            return results
+
+        pdu_type = apdu[0] >> 4
+        if pdu_type not in (2, 3):  # SimpleACK or ComplexACK
+            return results
+
+        if apdu[2] != 0x0E:  # must be ReadPropertyMultiple response
+            return results
+
+        # Skip PDU header: PDU(1) + invoke(1) + service(1) = 3 bytes
+        tail = apdu[3:]
+
+        # Expect context tag 0 opening (0x0E) for SEQUENCE OF ReadAccessResult
+        if len(tail) < 1 or tail[0] != 0x0E:
+            return results
+        tail = tail[1:]
+
+        # Skip Object Identifier (context 0, len 4)
+        if len(tail) >= 5 and tail[0] == 0x0C:
+            tail = tail[5:]
+
+        # Context tag 1 opening (0x1E) for SEQUENCE OF ReadAccessPropertyResult
+        if len(tail) >= 1 and tail[0] == 0x1E:
+            tail = tail[1:]
+
+        idx = 0
+        while idx < expected_count and len(tail) > 1:
+            # Each property result starts with: context tag 3 (0x3E) opening or direct value
+            # The format is: opening tag 0x3E, then property id (context 0, len 1), then
+            # optional array index, then value in context tag 3
+            if tail[0] == 0x3E:
+                tail = tail[1:]
+                # Skip property ID (context 0, len 1): 0x09 + 1 byte
+                if len(tail) >= 2 and tail[0] == 0x09:
+                    tail = tail[2:]
+
+            # Now parse the property value
+            if len(tail) < 2:
+                break
+            value, consumed = _extract_bacnet_value(tail)
+            if value is not None:
+                results[idx] = value
+            if consumed > 0:
+                tail = tail[consumed:]
+            else:
+                tail = tail[1:]
+            idx += 1
+
+    except Exception:
+        pass
+    return results
+
+
+def _extract_bacnet_value(buf: bytes) -> tuple[str | int | None, int]:
+    """Extract a single BACnet value from a byte buffer.
+
+    Returns (value, bytes_consumed). Handles CharacterString,
+    Unsigned, Enumerated, and opening/closing tags.
+    """
+    if len(buf) < 2:
+        return None, 0
+    tag = buf[0]
+    tag_number = (tag >> 4) & 0x0F
+    is_context = bool(tag & 0x08)
+    length_code = tag & 0x07
+
+    # Opening/closing tags
+    if length_code == 6:  # opening
+        return None, 1
+    if length_code == 7:  # closing
+        return None, 1
+
+    pos = 1
+    length = length_code
+    if length_code == 5:
+        if pos >= len(buf):
+            return None, 0
+        length = buf[pos]
+        pos += 1
+
+    if length <= 0 or pos + length > len(buf):
+        return None, 0
+
+    value_bytes = buf[pos:pos + length]
+    consumed = pos + length
+
+    if is_context:
+        if tag_number == 0:  # property identifier
+            return int.from_bytes(value_bytes, "big"), consumed
+        elif tag_number == 3 and length == 4:  # object identifier
+            return int.from_bytes(value_bytes, "big"), consumed
+        elif tag_number in (2, 3):  # generic value - try as string first
+            try:
+                return value_bytes.decode("utf-8", errors="replace"), consumed
+            except Exception:
+                return value_bytes.hex(), consumed
+        elif tag_number == 1:  # array index
+            return int.from_bytes(value_bytes, "big"), consumed
+        return value_bytes.hex()[:16], consumed
+
+    # Application tagged
+    if tag_number == 7:  # CharacterString
+        if length > 1 and value_bytes[0] in (0, 4):
+            return value_bytes[1:].decode("utf-8" if value_bytes[0] == 4 else "ascii", errors="replace"), consumed
+        return value_bytes.decode("latin-1", errors="replace"), consumed
+    elif tag_number == 2:  # Unsigned
+        return int.from_bytes(value_bytes, "big"), consumed
+    elif tag_number == 9:  # Enumerated
+        return int.from_bytes(value_bytes, "big"), consumed
+    elif tag_number == 4:  # Real
+        if length == 4:
+            import struct as _st
+            try:
+                return round(_st.unpack(">f", value_bytes)[0], 2), consumed
+            except Exception:
+                pass
+        return None, consumed
+    elif tag_number in (12,):  # ObjectIdentifier
+        if length == 4:
+            raw = int.from_bytes(value_bytes, "big")
+            return {"object_type": (raw >> 22) & 0x3FF, "instance": raw & 0x3FFFFF}, consumed
+        return None, consumed
+
+    return value_bytes.hex()[:16], consumed
 
 
 def _parse_read_property_ack(data: bytes) -> str | int | None:
@@ -519,28 +672,51 @@ def _enrich_device_sync(
         (BACNET_PROP_APPLICATION_SW_VERSION, "app_version"),
     ]
 
-    for prop_id, field in prop_reads:
-        value = _read_property_sync(sock, ip, dev_id, prop_id, timeout=timeout)
-        if value is not None and isinstance(value, str) and value.strip():
-            if field == "firmware":
-                enriched["firmware"] = value
-                enriched["firmware_version"] = value
-            elif field == "model":
-                enriched["model"] = value
-                enriched["device_type"] = value
-            elif field == "name":
-                enriched["name"] = value
-                enriched["hostname"] = value
-            elif field == "vendor":
-                enriched["vendor"] = value
-                enriched["vendor_name"] = value
-            elif field == "app_version":
-                if not enriched.get("firmware_version") or enriched["firmware_version"] == "Unknown":
+    # Send one ReadPropertyMultiple for all properties
+    prop_ids = [p for p, _ in prop_reads]
+    req = _build_read_property_multiple_request(dev_id, prop_ids)
+    try:
+        sock.sendto(req, (ip, 47808))
+        saved = sock.gettimeout()
+        sock.settimeout(timeout)
+        data, _ = sock.recvfrom(4096)
+        sock.settimeout(saved)
+        results = _parse_read_property_multiple_ack(data, len(prop_ids))
+        for idx, (prop_id, field) in enumerate(prop_reads):
+            value = results[idx] if idx < len(results) else None
+            if value is not None and isinstance(value, str) and value.strip():
+                if field == "firmware":
                     enriched["firmware"] = value
                     enriched["firmware_version"] = value
+                elif field == "model":
+                    enriched["model"] = value
+                    enriched["device_type"] = value
+                elif field == "name":
+                    enriched["name"] = value
+                    enriched["hostname"] = value
+                elif field == "vendor":
+                    enriched["vendor"] = value
+                    enriched["vendor_name"] = value
+                elif field == "app_version":
+                    if not enriched.get("firmware_version") or enriched["firmware_version"] == "Unknown":
+                        enriched["firmware"] = value
+                        enriched["firmware_version"] = value
+    except (OSError, socket.timeout):
+        pass
 
-    # Read object-list to get count
-    obj_count = _read_property_sync(sock, ip, dev_id, BACNET_PROP_OBJECT_LIST, timeout=2.0)
+    # Read object-list count via ReadPropertyMultiple
+    try:
+        req = _build_read_property_multiple_request(dev_id, [BACNET_PROP_OBJECT_LIST])
+        sock.sendto(req, (ip, 47808))
+        saved = sock.gettimeout()
+        sock.settimeout(2.0)
+        data, _ = sock.recvfrom(4096)
+        sock.settimeout(saved)
+        results = _parse_read_property_multiple_ack(data, 1)
+        obj_count = results[0] if results else None
+    except (OSError, socket.timeout):
+        obj_count = None
+
     if obj_count is not None:
         if isinstance(obj_count, int):
             enriched["object_count"] = obj_count
