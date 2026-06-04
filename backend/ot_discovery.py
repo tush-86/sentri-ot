@@ -283,16 +283,33 @@ def _build_read_property_request(
     object_type: int = BACNET_OBJECT_DEVICE,
     invoke_id: int = 1,
 ) -> bytes:
-    """Build a BACnet ReadProperty Confirmed-Request PDU."""
+    """Build a BACnet ReadProperty Confirmed-Request PDU.
+
+    PDU byte layout (Confirmed-Request, SA=1, SEG=0, MOR=0):
+      bits 7-4 = PDU type 0
+      bit 3   = SEG (0)
+      bit 2   = MOR (0)
+      bit 1   = SA  (1 = segmented response accepted)  ← THIS IS BIT 1, NOT BIT 0
+      bit 0   = reserved (0)
+      → 0x02 (binary 0000 0010)
+
+    APDU fields when SA=1 (ref ASHRAE 135-2020 §20.1.2):
+      PDU byte (1) | max-apdu (2, constrained whole number) | invoke-id (1) |
+      service-choice (1) | service-request
+
+    max-segments-accepted is OPTIONAL when SA=1; omit for simpler
+    interop with controllers that reject unknown fields.
+    """
     obj_id = (object_type << 22) | (device_instance & 0x3FFFFF)
 
     apdu = bytes([
-        0x00,                 # PDU type conf-req, SA=0 (no segmentation)
-        invoke_id & 0xFF,      # invoke ID
-        0x0C,                  # ReadProperty service
-        0x0C,                  # Object Identifier: context tag 0, length 4
+        0x02,             # PDU: Confirmed-Request, SA=1  (see docstring)
+        0x05, 0xC4,        # max-apdu = 1476 (constrained whole number, 2 bytes)
+        invoke_id & 0xFF,
+        0x0C,              # ReadProperty service
+        0x0C,              # Object Identifier: context tag 0, length 4
     ]) + struct.pack("!I", obj_id) + bytes([
-        0x19,                  # Property Identifier: context tag 1, length 1
+        0x19,              # Property Identifier: context tag 1, length 1
         property_id & 0xFF,
     ])
 
