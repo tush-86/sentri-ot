@@ -282,51 +282,42 @@ def _build_read_property_multiple_request(
     property_ids: list[int],
     object_type: int = BACNET_OBJECT_DEVICE,
     invoke_id: int = 1,
+    dnet: int = 200,
 ) -> bytes:
-    """Build a BACnet ReadPropertyMultiple Confirmed-Request PDU.
+    """Build a BACnet ReadPropertyMultiple Confirmed-Request.
 
-    Siemens PXC controllers accept ReadPropertyMultiple (service 0x0E)
-    but reject individual ReadProperty (service 0x0C).
-
-    Service encoding (ASHRAE 135-2020 §15.9):
-      ReadPropertyMultiple-Request ::= SEQUENCE OF ReadAccessSpecification
-      ReadAccessSpecification ::= SEQUENCE {
-        objectIdentifier   [0] BACnetObjectIdentifier,
-        listOfPropertyRefs [1] SEQUENCE OF PropertyReference
-      }
-      PropertyReference ::= SEQUENCE {
-        propertyIdentifier [0] BACnetPropertyIdentifier,
-        propertyArrayIndex [1] Unsigned OPTIONAL
-      }
+    Backed by Wireshark capture of YABE against Siemens PXC controllers.
+    Key differences from our earlier attempts:
+      1. NPDU includes destination BACnet network (DNET) + MAC (DADR).
+         Siemens requires this; bare NPDU gets REJECT.
+      2. max-apdu = 117 (0x75, 1-byte constrained whole number).
+         YABE uses this value; larger 2-byte values alter byte alignment.
     """
     obj_id = (object_type << 22) | (device_instance & 0x3FFFFF)
 
-    # Build service parameters for ReadPropertyMultiple
     params = bytes([
-        # Opening tag: SEQUENCE OF ReadAccessSpecification (context 0, opening)
-        0x0E,
-        # ReadAccessSpec: Object Identifier (context 0)
-        0x0C,
-    ]) + struct.pack("!I", obj_id)
-
-    # List of PropertyReferences (context 1, opening)
-    params += bytes([0x1E])
-    for prop_id in property_ids:
-        # PropertyReference: propertyIdentifier (context 0, length 1)
-        params += bytes([0x09, prop_id])
-    # List closing (context 1, closing)
-    params += bytes([0x1F])
-    # SEQUENCE closing (context 0, closing)
-    params += bytes([0x0F])
+        0x0E,              # SEQUENCE OF opening (context 0)
+        0x0C,              # Object ID (context 0, len 4)
+    ]) + struct.pack("!I", obj_id) + bytes([
+        0x1E,              # list-of-props opening (context 1)
+    ])
+    for pid in property_ids:
+        params += bytes([0x09, pid])  # PropertyReference (context 0, len 1)
+    params += bytes([0x1F, 0x0F])   # closing tags
 
     apdu = bytes([
-        0x02,             # PDU: Confirmed-Request, SA=1
-        0x05, 0xC4,        # max-apdu = 1476
+        0x02,              # PDU: Confirmed-Request, SA=1
+        0x75,              # max-apdu = 117 (match YABE, 1-byte encoding)
         invoke_id & 0xFF,
-        0x0E,              # ReadPropertyMultiple service
+        0x0E,              # ReadPropertyMultiple
     ]) + params
 
-    body = bytes([0x01, 0x00]) + apdu
+    # NPDU with destination BACnet network (Siemens PXC requirement)
+    npdu = bytes([0x01, 0x24])  # version 1, dest present, expecting reply
+    npdu += struct.pack(">H", dnet)  # 2-byte DNET
+    npdu += bytes([0x01, 0x32, 0xFF])  # DLEN=1, DADR=0x32, Hop=255
+
+    body = npdu + apdu
     bvll = struct.pack("!BBH", 0x81, 0x0A, 4 + len(body)) + body
     return bvll
 
