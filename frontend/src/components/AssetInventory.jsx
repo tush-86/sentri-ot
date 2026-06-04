@@ -234,7 +234,7 @@ export default function AssetInventory({ scan, loading, error }) {
                   const Icon = iconMap[asset.icon] || Cpu;
                   const isOpen = expanded[asset.id] || false;
                   const vulnCount = asset.vulnerabilities?.length || 0;
-                  const pointsCount = asset.points_count ?? asset.objects_count ?? 0;
+                  const pointsCount = asset.object_count ?? asset.objects_count ?? asset.points_count ?? 0;
                   return (
                     <tr key={asset.id} className="align-top transition hover:bg-slate-800/40">
                       <td colSpan={8} className="p-0">
@@ -270,9 +270,10 @@ export default function AssetInventory({ scan, loading, error }) {
                             <div className="mb-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                               <div className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
                                 <p className="mb-2 text-xs uppercase tracking-[0.25em] text-slate-500">Device Posture</p>
-                                <p className="text-sm text-slate-300">Firmware: <span className="font-semibold text-white">{asset.firmware_version || 'N/A'}</span></p>
-                                <p className="text-sm text-slate-300">Auth: <span className="font-semibold text-white">{asset.authentication || 'N/A'}</span></p>
-                                <p className="text-sm text-slate-300">Status: <span className="font-semibold text-white">{asset.security_status || 'Unknown'}</span></p>
+                                <p className="text-sm text-slate-300">Vendor: <span className="font-semibold text-white">{asset.vendor_name || asset.vendor || 'Unknown'}</span></p>
+                                <p className="text-sm text-slate-300">Model: <span className="font-semibold text-white">{asset.model || '--'}</span></p>
+                                <p className="text-sm text-slate-300">Firmware: <span className="font-semibold text-white">{asset.firmware_version || asset.firmware || 'Unknown'}</span></p>
+                                <p className="text-sm text-slate-300">Auth: <span className="font-semibold text-white">{asset.auth_method || 'None'}</span></p>
                               </div>
                               <div className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
                                 <p className="mb-2 text-xs uppercase tracking-[0.25em] text-slate-500">BACnet Objects</p>
@@ -285,9 +286,9 @@ export default function AssetInventory({ scan, loading, error }) {
                                 {asset.vendor && <p className="text-xs text-slate-500">{asset.vendor}</p>}
                               </div>
                               <div className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
-                                <p className="mb-2 text-xs uppercase tracking-[0.25em] text-slate-500">MAC / Device ID</p>
-                                <p className="font-mono text-xs text-slate-300">{asset.mac_address || asset.device_id || 'N/A'}</p>
-                                {asset.subnet && <p className="text-xs text-slate-500">Subnet: {asset.subnet}</p>}
+                                <p className="mb-2 text-xs uppercase tracking-[0.25em] text-slate-500">BACnet ID / MAC</p>
+                                <p className="font-mono text-xs text-slate-300">Device {asset.device_id || '--'}</p>
+                                <p className="font-mono text-xs text-slate-400">{asset.mac || asset.ip_address || ''}</p>
                               </div>
                             </div>
 

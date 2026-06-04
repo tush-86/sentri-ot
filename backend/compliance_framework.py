@@ -1970,21 +1970,23 @@ def _compute_framework_score(category_scores: dict) -> float:
     return round(total_weighted / total_weight, 1)
 
 
-def _compute_rating(score: float) -> str:
+def _compute_rating(score: float, device_count: int = -1) -> str:
     """Convert a numerical score to a compliance rating.
 
-    Args:
-        score: Float 0-100
-
-    Returns:
-        "Compliant", "Partial", or "At Risk"
+    When no BACnet devices are discovered the rating is always
+    "No Devices Found" regardless of the numeric score, since
+    compliance cannot be meaningfully assessed without device data.
     """
+    if device_count == 0:
+        return "No Devices Found"
     if score >= 85:
         return "Compliant"
     elif score >= 65:
-        return "Partial"
-    else:
+        return "Partially Compliant"
+    elif score >= 40:
         return "At Risk"
+    else:
+        return "Critical"
 
 
 def _find_critical_findings(desc_evaluated: list[dict], iec_evaluated: list[dict]) -> list[str]:
@@ -2070,37 +2072,49 @@ def evaluate_compliance(assets: list[dict], summary: dict) -> dict:
             - strengths: Top 5 compliant areas
     """
     # Build evidence from scan data
+    device_count = len(assets)
     evidence = _build_evidence_from_assets(assets, summary)
 
-    # Evaluate both frameworks
-    desc_evaluated, desc_cat_scores = _evaluate_controls(DESC_FRAMEWORK, evidence)
-    iec_evaluated, iec_cat_scores = _evaluate_controls(IEC62443_FRAMEWORK, evidence)
+    # When zero devices are discovered, compliance cannot be meaningfully
+    # assessed — all discovery-based evidence is absent.  We still run the
+    # evaluation so the report shows the control gaps, but the score is
+    # clamped to reflect the lack of data.
+    if device_count == 0:
+        overall_score = 0.0
+        desc_evaluated, desc_cat_scores = _evaluate_controls(DESC_FRAMEWORK, evidence)
+        iec_evaluated, iec_cat_scores = _evaluate_controls(IEC62443_FRAMEWORK, evidence)
+        desc_score = 0.0
+        iec_score = 0.0
+    else:
+        # Evaluate both frameworks
+        desc_evaluated, desc_cat_scores = _evaluate_controls(DESC_FRAMEWORK, evidence)
+        iec_evaluated, iec_cat_scores = _evaluate_controls(IEC62443_FRAMEWORK, evidence)
 
-    # Compute framework scores
-    desc_score = _compute_framework_score(desc_cat_scores)
-    iec_score = _compute_framework_score(iec_cat_scores)
+        # Compute framework scores
+        desc_score = _compute_framework_score(desc_cat_scores)
+        iec_score = _compute_framework_score(iec_cat_scores)
 
-    # Compute overall score (weighted average of both frameworks)
-    total_controls = sum(
-        info["total"] - info["not_observable"]
-        for info in desc_cat_scores.values()
-    ) + sum(
-        info["total"] - info["not_observable"]
-        for info in iec_cat_scores.values()
-    )
-
-    if total_controls > 0:
-        desc_weight = sum(
+        # Compute overall score (weighted average of both frameworks)
+        total_controls = sum(
             info["total"] - info["not_observable"]
             for info in desc_cat_scores.values()
-        ) / total_controls
-        iec_weight = sum(
+        ) + sum(
             info["total"] - info["not_observable"]
             for info in iec_cat_scores.values()
-        ) / total_controls
-        overall_score = round((desc_score * desc_weight + iec_score * iec_weight), 1)
-    else:
-        overall_score = 0.0
+        )
+
+        if total_controls > 0:
+            desc_weight = sum(
+                info["total"] - info["not_observable"]
+                for info in desc_cat_scores.values()
+            ) / total_controls
+            iec_weight = sum(
+                info["total"] - info["not_observable"]
+                for info in iec_cat_scores.values()
+            ) / total_controls
+            overall_score = round((desc_score * desc_weight + iec_score * iec_weight), 1)
+        else:
+            overall_score = 0.0
 
     # Generate findings
     critical_findings = _find_critical_findings(desc_evaluated, iec_evaluated)
@@ -2108,7 +2122,7 @@ def evaluate_compliance(assets: list[dict], summary: dict) -> dict:
 
     return {
         "score": overall_score,
-        "rating": _compute_rating(overall_score),
+        "rating": _compute_rating(overall_score, device_count),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "frameworks": {
             "DESC": {

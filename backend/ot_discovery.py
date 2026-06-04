@@ -250,6 +250,449 @@ def _parse_i_am(data: bytes, addr: tuple[str, int]) -> dict[str, Any] | None:
         return None
 
 
+# ── BACnet ReadProperty for device enrichment ───────────────────────────────
+# After Who-Is/I-Am discovery, we send unicast ReadProperty requests to each
+# controller to pull firmware, model, vendor name, object names, and object
+# count.  These are confirmed BACnet requests (expect Complex-ACK replies).
+
+
+BACNET_OBJECT_DEVICE = 8
+
+# Standard BACnet property identifiers (ASHRAE 135-2020)
+BACNET_PROP_FIRMWARE_REVISION = 44
+BACNET_PROP_MODEL_NAME = 70
+BACNET_PROP_OBJECT_NAME = 77
+BACNET_PROP_OBJECT_LIST = 76
+BACNET_PROP_VENDOR_NAME = 121
+BACNET_PROP_APPLICATION_SW_VERSION = 12
+
+
+def _build_read_property_request(
+    device_instance: int,
+    property_id: int,
+    object_type: int = BACNET_OBJECT_DEVICE,
+    invoke_id: int = 1,
+) -> bytes:
+    """Build a BACnet ReadProperty Confirmed-Request PDU.
+
+    Returns a complete BVLC + NPDU + APDU byte string ready to send via UDP.
+
+    APDU structure (Confirmed-Request):
+      PDU type=0 (confirmed-req), SEG=0, MOR=0, SA=1  → 0x01
+      Max segments accepted  → 0x02
+      Max APDU accepted      → 0x05 0xC4 (1476, matching discovery)
+      Invoke ID              → 1 byte
+      Service choice ReadProperty → 0x0C
+      Object Identifier (context tag 0, length 4)  → 0x0C + 4 bytes
+      Property Identifier (context tag 1, length 1) → 0x19 + 1 byte
+    """
+    obj_id = (object_type << 22) | (device_instance & 0x3FFFFF)
+
+    apdu = bytes([
+        0x01,            # PDU type conf-req, SA=1
+        0x02,            # max segments = 2
+        0x05, 0xC4,      # max APDU = 1476
+        invoke_id & 0xFF,  # invoke ID
+        0x0C,            # ReadProperty service
+        # Object Identifier: context tag 0, length 4
+        0x0C,
+    ]) + struct.pack("!I", obj_id)
+
+    # Property Identifier: context tag 1
+    # Properties 0-127 fit in one byte; 128-255 also one byte
+    apdu += bytes([0x19, property_id & 0xFF])
+
+    # NPDU: version 1, no dest (local device)
+    npdu = bytes([0x01, 0x00]) + apdu
+
+    # BVLC: Original-Unicast-NPDU
+    bvlc_len = 4 + len(npdu)
+    bvll = struct.pack("!BBH", 0x81, 0x0A, bvlc_len) + npdu
+    return bvll
+
+
+def _parse_read_property_ack(data: bytes) -> str | int | None:
+    """Parse a BACnet Complex-ACK or Error response to ReadProperty.
+
+    Returns the decoded property value (str, int, or None on failure).
+    Handles the common BACnet data types used by Siemens controllers.
+
+    Simplified parser that extracts CharacterString and Unsigned values from
+    the Complex-ACK APDU without decoding every tag.
+    """
+    try:
+        if len(data) < 10 or data[0] != 0x81:
+            return None
+
+        # BVLC + NPDU → find APDU start (after BVLC length)
+        bvlc_len = int.from_bytes(data[2:4], "big")
+        if bvlc_len > len(data):
+            return None
+
+        apdu_start = 4  # BVLC header is always 4 bytes
+        apdu = data[apdu_start:]
+
+        if len(apdu) < 4:
+            return None
+
+        pdu_type = apdu[0] >> 4
+        if pdu_type == 0x05:  # Error PDU
+            # Error class + error code follow invoke ID
+            if len(apdu) >= 5:
+                error_class = apdu[3]
+                error_code = apdu[4]
+                # PROPERTY_UNKNOWN = error_class 2, code 1
+                if error_class == 2:
+                    return None  # property not supported (expected for some)
+            return None
+
+        if pdu_type not in (0x02, 0x03):  # Complex-ACK or Segmented-ACK
+            return None
+
+        invoke_id = apdu[1]
+        svc = apdu[2]
+        if svc != 0x0C:  # must be ReadProperty response
+            return None
+
+        # After service choice: Object ID (context 0, len 4) → Property ID (context 1, len 1)
+        # → Opening tag for ReadProperty result (context 3, tag 0x3E)
+        # → Then the value depends on the data type
+
+        tail = apdu[3:]  # skip PDU type, invoke ID, service
+
+        # Skip Object Identifier (context tag 0, length 4) → 5 bytes
+        if len(tail) >= 5 and tail[0] == 0x0C:
+            tail = tail[5:]
+
+        # Skip Property Identifier (context tag 1, length 1) → 2 bytes
+        if len(tail) >= 2 and tail[0] == 0x19:
+            tail = tail[2:]
+
+        # ReadProperty result: context tag 3 opening tag (0x3E) or context tag 3 with value
+        if len(tail) < 1:
+            return None
+
+        # Opening tag 0x3E → skip, then expect a value tag
+        if tail[0] == 0x3E:
+            tail = tail[1:]
+
+        if len(tail) < 2:
+            return None
+
+        tag = tail[0]
+        tag_number = (tag >> 4) & 0x0F
+        tag_class_bit = tag & 0x08
+        length_code = tag & 0x07
+
+        # Ignore another opening tag
+        if tag == 0x2E:  # context tag 2 opening
+            tail = tail[1:]
+            if len(tail) < 2:
+                return None
+            tag = tail[0]
+            tag_number = (tag >> 4) & 0x0F
+            length_code = tag & 0x07
+
+        pos = 1
+        length = length_code
+        if length_code == 5:  # extended length
+            if pos >= len(tail):
+                return None
+            length = tail[pos]
+            pos += 1
+        if length <= 0 or pos + length > len(tail):
+            return None
+
+        value_bytes = tail[pos:pos + length]
+
+        # Determine data type from tag
+        if tag_class_bit == 0:
+            app_tag = tag_number
+        else:
+            # Context-specific — the expected type depends on the property
+            # For properties we query:
+            #   firmware/model/vendor/object-name → CharacterString (app tag 7)
+            #   object-list → BACnetARRAY (opening) of ObjectIdentifiers
+            app_tag = 7  # default to CharacterString for these properties
+
+        if app_tag == 7:  # CharacterString
+            # First byte is encoding: 0=ANSI X3.4, 4=ISO 10646 (UCS-2/UTF-16BE)
+            if length > 0:
+                encoding = value_bytes[0]
+                if length > 1:
+                    if encoding == 0:  # ASCII/ANSI
+                        return value_bytes[1:].decode("ascii", errors="replace")
+                    elif encoding in (4, 5):  # UTF-8 or ISO 10646
+                        return value_bytes[1:].decode("utf-8", errors="replace")
+                    else:
+                        return value_bytes[1:].decode("latin-1", errors="replace")
+                return ""
+            return None
+        elif app_tag == 2:  # Unsigned
+            return int.from_bytes(value_bytes, "big")
+        elif app_tag == 9:  # Enumerated
+            return int.from_bytes(value_bytes, "big")
+        elif app_tag == 12:  # ObjectIdentifier
+            # For object-list items: 4-byte encoded (type<<22 | instance)
+            if length == 4:
+                raw = int.from_bytes(value_bytes, "big")
+                obj_type = (raw >> 22) & 0x3FF
+                obj_instance = raw & 0x3FFFFF
+                return {"object_type": obj_type, "instance": obj_instance}
+            return None
+        elif tag == 0x3E or tag == 0x0E:  # Opening tag for array/list
+            # Return a count marker so caller knows there are objects
+            return "<array>"
+
+        # Fallback: return raw value as hex
+        return value_bytes.hex() if len(value_bytes) <= 16 else f"{len(value_bytes)} bytes"
+
+    except Exception:
+        return None
+
+
+def _read_property_sync(
+    sock: socket.socket,
+    ip: str,
+    device_instance: int,
+    property_id: int,
+    timeout: float = 2.0,
+) -> str | int | None:
+    """Send ReadProperty and parse the Complex-ACK response."""
+    req = _build_read_property_request(device_instance, property_id)
+    try:
+        sock.sendto(req, (ip, 47808))
+        saved = sock.gettimeout()
+        sock.settimeout(timeout)
+        try:
+            data, _ = sock.recvfrom(4096)
+            return _parse_read_property_ack(data)
+        finally:
+            sock.settimeout(saved)
+    except (OSError, socket.timeout):
+        return None
+
+
+def _enrich_device_sync(
+    sock: socket.socket,
+    device: dict[str, Any],
+    timeout: float = 1.5,
+) -> dict[str, Any]:
+    """Read Device-object properties to fill firmware, model, vendor, and object count.
+
+    Returns a shallow copy of *device* with real values from the controller
+    replacing the "Unknown"/"None" defaults set during I-Am discovery.
+    """
+    enriched = dict(device)
+    ip = str(device.get("ip", ""))
+    dev_id = device.get("device_id")
+    if not ip or dev_id is None:
+        return enriched
+
+    prop_reads: list[tuple[int, str]] = [
+        (BACNET_PROP_FIRMWARE_REVISION, "firmware"),
+        (BACNET_PROP_MODEL_NAME, "model"),
+        (BACNET_PROP_OBJECT_NAME, "name"),
+        (BACNET_PROP_VENDOR_NAME, "vendor"),
+        (BACNET_PROP_APPLICATION_SW_VERSION, "app_version"),
+    ]
+
+    for prop_id, field in prop_reads:
+        value = _read_property_sync(sock, ip, dev_id, prop_id, timeout=timeout)
+        if value is not None and isinstance(value, str) and value.strip():
+            if field == "firmware":
+                enriched["firmware"] = value
+                enriched["firmware_version"] = value
+            elif field == "model":
+                enriched["model"] = value
+                enriched["device_type"] = value
+            elif field == "name":
+                enriched["name"] = value
+                enriched["hostname"] = value
+            elif field == "vendor":
+                enriched["vendor"] = value
+                enriched["vendor_name"] = value
+            elif field == "app_version":
+                if not enriched.get("firmware_version") or enriched["firmware_version"] == "Unknown":
+                    enriched["firmware"] = value
+                    enriched["firmware_version"] = value
+
+    # Read object-list to get count
+    obj_count = _read_property_sync(sock, ip, dev_id, BACNET_PROP_OBJECT_LIST, timeout=2.0)
+    if obj_count is not None:
+        if isinstance(obj_count, int):
+            enriched["object_count"] = obj_count
+        elif isinstance(obj_count, str) and obj_count == "<array>":
+            enriched["object_count"] = -1  # marker: array received, count unknown
+
+    return enriched
+
+
+def _read_object_names_sync(
+    sock: socket.socket,
+    ip: str,
+    device_instance: int,
+    max_objects: int = 30,
+    timeout: float = 1.5,
+) -> list[dict[str, Any]]:
+    """Enumerate the first *max_objects* from the controller's object-list
+    and read each object's name and type.
+
+    Many Siemens controllers have 100+ objects; we cap at *max_objects* to
+    keep scan times reasonable.  The full list can be read on-demand via the
+    asset-detail page in a future release.
+    """
+    objects: list[dict[str, Any]] = []
+
+    # Step 1: read the first chunk of the object-list
+    # Most controllers return the array opening tag with elements inline.
+    # We read the raw response and look for ObjectIdentifier values.
+    req = _build_read_property_request(device_instance, BACNET_PROP_OBJECT_LIST)
+    try:
+        sock.sendto(req, (ip, 47808))
+        saved_timeout = sock.gettimeout()
+        sock.settimeout(timeout)
+        try:
+            data, _ = sock.recvfrom(4096)
+        finally:
+            sock.settimeout(saved_timeout)
+
+        if len(data) < 14 or data[0] != 0x81:
+            return objects
+
+        # Walk the Complex-ACK looking for ObjectIdentifier values (context 0, len 4)
+        # that appear after the array opening tag
+        bvlc_len = int.from_bytes(data[2:4], "big")
+        apdu = data[4:bvlc_len]  # APDU is within BVLC length
+        if len(apdu) < 10:
+            return objects
+
+        pos = 3  # skip PDU type, invoke ID, service choice
+
+        # Skip obj id (0x0C + 4) and prop id (0x19 + 1)
+        skipped = 0
+        while pos < len(apdu) - 1 and skipped < 2:
+            if apdu[pos] == 0x0C and pos + 5 <= len(apdu):
+                pos += 5
+                skipped += 1
+            elif apdu[pos] == 0x19 and pos + 2 <= len(apdu):
+                pos += 2
+                skipped += 1
+            elif apdu[pos] in (0x3E, 0x2E, 0x0E):  # opening tags
+                pos += 1
+                skipped += 1
+            else:
+                pos += 1
+
+        # Now scan for ObjectIdentifier entries: 0x0C + 4 bytes
+        while pos + 5 <= len(apdu) and len(objects) < max_objects:
+            if apdu[pos] == 0x0C:
+                raw = int.from_bytes(apdu[pos + 1:pos + 5], "big")
+                obj_type = (raw >> 22) & 0x3FF
+                obj_instance = raw & 0x3FFFFF
+                # Only include non-Device objects in the child list
+                if obj_type != BACNET_OBJECT_DEVICE:
+                    objects.append({
+                        "object_type": obj_type,
+                        "instance": obj_instance,
+                        "name": None,
+                    })
+                pos += 5
+            else:
+                pos += 1
+
+        # Step 2: read names for a subset of objects (first 20)
+        name_budget = min(20, len(objects))
+        for idx in range(name_budget):
+            obj = objects[idx]
+            obj_instance = obj["instance"]
+            obj_type = obj["object_type"]
+
+            # Build ReadProperty for Object_Name of this specific object
+            obj_id = (obj_type << 22) | (obj_instance & 0x3FFFFF)
+            apdu_req = bytes([
+                0x01, 0x02, 0x05, 0xC4,
+                (0x80 + idx + 1),  # unique invoke ID per request
+                0x0C,
+                0x0C,
+            ]) + struct.pack("!I", obj_id) + bytes([0x19, BACNET_PROP_OBJECT_NAME])
+
+            npdu = bytes([0x01, 0x00]) + apdu_req
+            bvlc_len = 4 + len(npdu)
+            bvll = struct.pack("!BBH", 0x81, 0x0A, bvlc_len) + npdu
+
+            try:
+                sock.sendto(bvll, (ip, 47808))
+                saved = sock.gettimeout()
+                sock.settimeout(1.0)
+                try:
+                    resp, _ = sock.recvfrom(1024)
+                    name = _parse_read_property_ack(resp)
+                    if isinstance(name, str) and name.strip():
+                        objects[idx]["name"] = name
+                finally:
+                    sock.settimeout(saved)
+            except (OSError, socket.timeout):
+                pass
+
+    except (OSError, socket.timeout):
+        pass
+
+    return objects
+
+
+def _enrich_assets_sync(
+    devices: list[dict[str, Any]],
+    progress_cb: Callable[[int, str], None] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Enrich a batch of discovered BACnet devices with ReadProperty.
+
+    Opens one UDP socket, then reads Device-object properties (firmware,
+    model, vendor, object count) and enumerates the first N object names
+    for each controller.  Returns a dict keyed by device_id.
+    """
+    local_ip = _local_bacnet_ip()
+    enriched: dict[int, dict[str, Any]] = {}
+
+    try:
+        # Use ephemeral port to avoid conflicts
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((local_ip, 0))
+        sock.settimeout(0.25)
+    except OSError:
+        return enriched
+
+    try:
+        for idx, device in enumerate(devices):
+            dev_id = device.get("device_id")
+            ip = str(device.get("ip", ""))
+            if dev_id is None or not ip:
+                continue
+
+            if progress_cb:
+                progress_cb(55 + int(30 * idx / max(len(devices), 1)),
+                           f"Reading properties from {ip} (device {dev_id})")
+
+            extra = _enrich_device_sync(sock, device, timeout=1.5)
+            enriched[dev_id] = extra
+
+            # Read object names for the first few devices
+            if idx < 5:
+                objects = _read_object_names_sync(sock, ip, dev_id, max_objects=20, timeout=2.0)
+                enriched[dev_id]["objects"] = objects
+                enriched[dev_id]["object_count"] = len(objects)
+
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    return enriched
+
+
 def _try_bacpypes_parse(data: bytes, addr: tuple[str, int]) -> dict[str, Any] | None:
     """Optional parser. Raw parser above is the primary path for this deployment."""
     try:
@@ -530,11 +973,29 @@ async def _run_passive_scan(progress_cb: Callable[[int, str], None] | None = Non
 
 
 async def _run_active_scan(progress_cb: Callable[[int, str], None] | None = None) -> list[dict[str, Any]]:
-    # Safe active mode: start with BACnet discovery that is known to work.
+    # Step 1: BACnet Who-Is / I-Am discovery (fast)
     devices = await _full_bacnet_discovery(timeout=12.0, progress_cb=progress_cb)
     assets = [_build_bacnet_asset(d) for d in devices]
 
-    # Optional lightweight TCP check only when discovery mode is "full".
+    # Step 2: Enrich each device with ReadProperty (firmware, model, vendor,
+    #          object count, object names).  Run in a thread so Uvicorn stays
+    #          responsive.
+    if devices and progress_cb:
+        progress_cb(55, f"Enriching {len(devices)} BACnet devices with ReadProperty")
+    enriched = await asyncio.to_thread(_enrich_assets_sync, devices, progress_cb)
+    # Merge enrichment back into assets
+    for asset in assets:
+        dev_id = asset.get("device_id")
+        if dev_id is not None and dev_id in enriched:
+            extra = enriched[dev_id]
+            for key in ("firmware", "firmware_version", "model", "name", "hostname",
+                        "vendor", "vendor_name", "object_count", "objects"):
+                if key in extra and extra[key] is not None:
+                    asset[key] = extra[key]
+            if extra.get("device_type"):
+                asset["device_type"] = extra["device_type"]
+
+    # Step 3: Optional TCP scan ("full" discovery mode only)
     networks = _discover_local_networks()
     if _get_bacnet_discovery() == "full":
         for network in networks:
