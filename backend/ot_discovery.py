@@ -65,6 +65,16 @@ BACNET_VENDORS: dict[int, str] = {
     458: "Sauter",
 }
 
+# Vendor-specific model defaults when ReadProperty is not available
+VENDOR_DEFAULT_MODELS: dict[int, str] = {
+    7: "Siemens PXC Controller",
+    5: "Honeywell CIPer Controller",
+    2: "Johnson Controls FEC Controller",
+    15: "Trane UC Controller",
+    8: "Delta Controls eBCON Controller",
+    42: "Schneider Electric AS-P Controller",
+}
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -890,12 +900,12 @@ def _build_bacnet_asset(device: dict[str, Any]) -> dict[str, Any]:
         "protocol": "BACnet/IP",
         "protocols": ["BACnet/IP"],
         "ports": [47808],
-        "device_type": "BACnet Device",
+        "device_type": VENDOR_DEFAULT_MODELS.get(vendor_id, "BACnet Controller"),
         "type": "BMS Controller",
         "vendor": vendor_name,
         "vendor_id": vendor_id,
         "device_id": device_id,
-        "model": "Unknown",
+        "model": VENDOR_DEFAULT_MODELS.get(vendor_id, "Unknown"),
         "firmware": "Unknown",
         "firmware_version": "Unknown",
         "segmentation": device.get("segmentation", "Unknown"),
