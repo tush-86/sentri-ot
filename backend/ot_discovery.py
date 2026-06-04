@@ -282,7 +282,6 @@ def _build_read_property_multiple_request(
     property_ids: list[int],
     object_type: int = BACNET_OBJECT_DEVICE,
     invoke_id: int = 1,
-    dnet: int = 200,
 ) -> bytes:
     """Build a YABE-compatible BACnet ReadProperty Confirmed-Request.
 
@@ -306,12 +305,10 @@ def _build_read_property_multiple_request(
         property_ids[0] & 0xFF if property_ids else 77,
     ])
 
-    # NPDU with destination BACnet network (Siemens PXC requirement)
-    npdu = bytes([0x01, 0x24])  # version 1, dest present, expecting reply
-    npdu += struct.pack(">H", dnet)  # 2-byte DNET
-    npdu += bytes([0x01, 0x32, 0xFF])  # DLEN=1, DADR=0x32, Hop=255
-
-    body = npdu + apdu
+    # NPDU without destination (local network).  Siemens PXC controllers
+    # on the same BACnet segment accept this; only cross-network devices
+    # need DNET/DADR routing.  YABE uses local NPDU for same-subnet queries.
+    body = bytes([0x01, 0x00]) + apdu  # NPDU version 1, no dest
     bvll = struct.pack("!BBH", 0x81, 0x0A, 4 + len(body)) + body
     return bvll
 
