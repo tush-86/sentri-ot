@@ -662,9 +662,18 @@ def _enrich_device_sync(
             sock.sendto(req, (ip, 47808))
             saved = sock.gettimeout()
             sock.settimeout(timeout)
-            data, _ = sock.recvfrom(4096)
+            # Loop: skip unrelated BACnet traffic until we get our response
+            deadline = time.monotonic() + timeout
+            value = None
+            while time.monotonic() < deadline:
+                try:
+                    data, _ = sock.recvfrom(4096)
+                    value = _parse_read_property_ack(data)
+                    if value is not None:
+                        break
+                except socket.timeout:
+                    break
             sock.settimeout(saved)
-            value = _parse_read_property_ack(data)
             if value is not None and isinstance(value, str) and value.strip():
                 if field == "firmware":
                     enriched["firmware"] = value
