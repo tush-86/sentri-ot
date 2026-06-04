@@ -253,6 +253,12 @@ async def start_scan() -> dict[str, Any]:
     }
 
 
+@app.post("/api/scan")
+async def start_scan_legacy() -> dict[str, Any]:
+    """Compatibility alias for older docs/scripts."""
+    return await start_scan()
+
+
 @app.get("/api/scan/status")
 async def scan_status() -> dict[str, Any]:
     """Current scan status, read from database."""
@@ -324,6 +330,12 @@ async def scan_history_endpoint(limit: int = Query(20, ge=1, le=100)) -> dict[st
     return {"history": history}
 
 
+@app.get("/api/scans")
+async def scans_legacy(limit: int = Query(20, ge=1, le=100)) -> dict[str, Any]:
+    """Compatibility alias for older docs/scripts."""
+    return await scan_history_endpoint(limit=limit)
+
+
 @app.get("/api/scan/latest/alerts")
 async def latest_alerts_endpoint() -> dict[str, Any]:
     """Latest scan alerts."""
@@ -365,6 +377,16 @@ async def list_assets(
     return await get_assets(filters=filters or None, page=page, per_page=per_page)
 
 
+@app.get("/api/devices")
+async def list_devices_legacy(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(100, ge=1, le=500),
+    search: Optional[str] = None,
+) -> dict[str, Any]:
+    """Compatibility alias for older docs/scripts."""
+    return await list_assets(page=page, per_page=per_page, search=search)
+
+
 @app.get("/api/assets/stats")
 async def asset_stats() -> dict[str, Any]:
     """Aggregated asset statistics for dashboard."""
@@ -378,6 +400,12 @@ async def asset_detail(asset_id: str) -> dict[str, Any]:
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     return asset
+
+
+@app.get("/api/devices/{asset_id}")
+async def device_detail_legacy(asset_id: str) -> dict[str, Any]:
+    """Compatibility alias for older docs/scripts."""
+    return await asset_detail(asset_id)
 
 
 # ── API: alerts ──────────────────────────────────────────────────────────────
@@ -467,6 +495,12 @@ async def compliance_latest() -> dict[str, Any]:
         fw_data.pop("controls", None)
         fw_data.pop("category_scores", None)
     return compliance_data
+
+
+@app.get("/api/compliance/overview")
+async def compliance_overview_legacy() -> dict[str, Any]:
+    """Compatibility alias for older docs/scripts."""
+    return await compliance_latest()
 
 
 @app.get("/api/compliance/frameworks")

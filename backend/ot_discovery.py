@@ -1,22 +1,26 @@
-"""Sentri OT — Passive/Active BACnet discovery engine.
+"""Sentri OT - BACnet discovery engine (Windows hotfix build).
 
-Passive mode (default):
-    - Only sends BACnet Who-Is UDP broadcast (standard BMS behaviour).
-    - Listens on UDP 47808 for I-Am responses.
-    - NO TCP SYN probes, NO UDP probes to non-BACnet ports.
+This replacement keeps the public API expected by the backend:
+- scan_environment_async()
+- scan_environment()
+- scan_real_ot_environment()
 
-Active mode (opt-in via SENTRI_OT_SCAN_MODE=active):
-    - Full port scanning + Modbus probing + ReadProperty for firmware.
+It uses a known-good raw BACnet/IP Who-Is flow tested on the live BMS PC:
+- local BACnet NIC: 192.168.1.205
+- broadcast: 192.168.1.255
+- UDP/47808
 
-Simulate mode (SENTRI_OT_SCAN_MODE=simulate):
-    - Generates realistic large-scale BMS synthetic data for demo.
+Environment overrides:
+- SENTRI_OT_SCAN_MODE=passive|active|simulate
+- SENTRI_OT_SCAN_NETWORKS=192.168.1.0/24
+- SENTRI_OT_BACNET_LOCAL_IP=192.168.1.205
+- SENTRI_OT_BACNET_DISCOVERY=whois|listen|full
 """
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
 import os
 import random
 import socket
@@ -26,59 +30,80 @@ import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
-from backend.ot_simulator import run_alert_feed, run_compliance_check
+try:
+    from backend.ot_simulator import run_alert_feed, run_compliance_check
+except Exception:  # keep module importable even if simulator deps are unavailable
+    def run_alert_feed(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return []
 
-# ── environment helpers ─────────────────────────────────────────────────────
+    def run_compliance_check(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"score": 0, "controls": []}
+
+
+BACNET_VENDORS: dict[int, str] = {
+    2: "Johnson Controls",
+    5: "Honeywell",
+    7: "Siemens",
+    8: "Delta Controls",
+    15: "Trane",
+    16: "Lutron",
+    24: "Automated Logic",
+    33: "Carrier",
+    42: "Schneider Electric",
+    65: "Distech Controls",
+    95: "Reliable Controls",
+    116: "Contemporary Controls",
+    127: "KMC Controls",
+    133: "Alerton",
+    140: "EasyIO",
+    260: "Loytec",
+    330: "Yardi",
+    347: "Neptronic",
+    410: "Belimo",
+    458: "Sauter",
+}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _get_mode() -> str:
-    return os.environ.get("SENTRI_OT_SCAN_MODE", "passive").lower()
+    return os.environ.get("SENTRI_OT_SCAN_MODE", "passive").lower().strip()
 
 
 def _get_bacnet_discovery() -> str:
-    return os.environ.get("SENTRI_OT_BACNET_DISCOVERY", "whois").lower()
+    return os.environ.get("SENTRI_OT_BACNET_DISCOVERY", "whois").lower().strip()
 
 
 def _get_configured_networks() -> list[ipaddress.IPv4Network]:
     raw = os.environ.get("SENTRI_OT_SCAN_NETWORKS", "").strip()
+    networks: list[ipaddress.IPv4Network] = []
     if raw:
-        networks = []
-        for entry in raw.split(","):
-            try:
-                networks.append(ipaddress.ip_network(entry.strip(), strict=False))
-            except ValueError:
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
                 continue
-        if networks:
-            return networks
-    return _discover_local_networks()
+            try:
+                networks.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                pass
+    return networks
 
 
 def _discover_local_networks() -> list[ipaddress.IPv4Network]:
-    networks = []
-    try:
-        result = subprocess.run(
-            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=3,
-        )
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            try:
-                networks.append(ipaddress.ip_network(parts[3], strict=False))
-            except ValueError:
-                continue
-    except Exception:
-        pass
-    if not networks:
-        for cidr in ["192.168.0.0/24", "10.0.0.0/24", "172.16.0.0/24"]:
-            networks.append(ipaddress.ip_network(cidr, strict=False))
-    return networks
+    configured = _get_configured_networks()
+    if configured:
+        return configured
+
+    # Deployment-specific safe default for the BACnet Ethernet subnet.
+    return [ipaddress.ip_network("192.168.1.0/24", strict=False)]
+
+
+def _local_bacnet_ip() -> str:
+    return os.environ.get("SENTRI_OT_BACNET_LOCAL_IP", "192.168.1.205").strip() or "192.168.1.205"
 
 
 def _resolve_hostname(addr: str) -> str:
@@ -88,235 +113,161 @@ def _resolve_hostname(addr: str) -> str:
         return addr
 
 
-# ── known BACnet vendor IDs ─────────────────────────────────────────────────
-
-BACNET_VENDORS: dict[int, str] = {
-    2: "Siemens",
-    5: "Honeywell",
-    7: "Schneider Electric",
-    8: "Trane",
-    12: "Johnson Controls",
-    14: "Carrier",
-    15: "Delta Controls",
-    16: "Mitsubishi Electric",
-    17: "Fujitsu",
-    18: "Toshiba",
-    19: "Lennox",
-    20: "Daikin",
-    21: "LG Electronics",
-    22: "Panasonic",
-    24: "York",
-    25: "Ruskin",
-    26: "Alerton",
-    27: "Distech Controls",
-    28: "KMC Controls",
-    37: "Trend Controls",
-    43: "Reliable Controls",
-    56: "Tridium",
-    60: "CONTEC",
-    100: "BACnet Stack at SourceForge",
-    101: "BACnet.org",
-    137: "Phoenix Controls",
-    155: "Automated Logic",
-    161: "Andover Controls",
-    181: "Richards-Zeta",
-    183: "Obvious Micro Solutions",
-    245: "Siemens (Building Technologies)",
-    268: "Honeywell (Tridium)",
-    279: "Loytec",
-    300: "Chipkin Automation Systems",
-    366: "Contemporary Controls",
-    380: "WAGO",
-    419: "Renesas",
-    444: "Johnson Controls (Tyco)",
-    477: "Beckhoff Automation",
-    522: "Moxa",
-    538: "Phoenix Contact",
-    573: "PTC",
-    596: "Samsung SDS",
-    619: "Embedded Systems",
-    643: "Streamside Solutions",
-}
-
-SEGMENT_ZONES: list[str] = [
-    "Zone 0", "Zone 1", "Zone 2", "Zone 3", "DMZ",
-]
-
-CRITICALITIES = ["Critical", "High", "Medium", "Low"]
-
-SEVERITY_WEIGHT = {"Critical": 12, "High": 8, "Medium": 4, "Low": 1}
-RISK_BY_SCORE = [(16, "Critical"), (9, "High"), (4, "Medium"), (0, "Low")]
+def _infer_zone(ip_str: str) -> str:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        if ip_str.startswith("192.168.1."):
+            last = int(ip_str.split(".")[-1])
+            if 100 <= last <= 120:
+                return "BMS Field Controllers"
+            if last <= 30:
+                return "BMS Supervisory / Server VLAN"
+        if ip.is_private:
+            return "OT / BMS Network"
+    except Exception:
+        pass
+    return "Unknown"
 
 
-def _risk_level(vulnerabilities: list[dict]) -> str:
-    score = sum(SEVERITY_WEIGHT.get(v["severity"], 0) for v in vulnerabilities)
-    for threshold, label in RISK_BY_SCORE:
-        if score >= threshold:
-            return label
+def _risk_level(vulnerabilities: list[dict[str, Any]]) -> str:
+    severities = {str(v.get("severity", "")).lower() for v in vulnerabilities}
+    if "critical" in severities:
+        return "Critical"
+    if "high" in severities:
+        return "High"
+    if "medium" in severities:
+        return "Medium"
     return "Low"
 
 
-def _infer_zone(ip_str: str) -> str:
-    try:
-        first = int(ip_str.split(".")[0])
-    except (ValueError, IndexError):
-        return "Zone 0"
-    mapping = {10: "Zone 1", 172: "Zone 2", 192: "Zone 3"}
-    return mapping.get(first, "DMZ")
-
-
-# ── BACnet Who-Is / I-Am helpers ────────────────────────────────────────────
-
-
 def _build_whois_packet() -> bytes:
-    """Construct a BACnet Who-Is broadcast packet (BVLL + NPDU + APDU)."""
-    # BVLL header: type=0x81, func=0x0B (Original-Broadcast-NPDU), length.
-    # BACnet/IP uses 0x0A for Original-Unicast-NPDU and 0x0B for Original-Broadcast-NPDU.
-    # We build manually for portability.
-    whois_apdu = bytes([
-        0x01,  # APDU type: Confirmed-Request / Unconfirmed
-        0x20,  # Unconfirmed-Request, service=0 (Who-Is)
-        # No device instance range (global Who-Is)
+    """Construct a known-good BACnet/IP global Who-Is broadcast packet."""
+    return bytes([
+        0x81, 0x0B, 0x00, 0x0C,  # BVLC: Original-Broadcast-NPDU, len=12
+        0x01, 0x20,              # NPDU: version 1, destination present
+        0xFF, 0xFF,              # DNET=65535 global broadcast
+        0x00,                    # DLEN=0
+        0xFF,                    # Hop count=255 for BACnet global broadcast
+        0x10,                    # APDU: unconfirmed request
+        0x08,                    # service choice: Who-Is
     ])
-    whois_apdu = bytes([0x10, 0x00]) + whois_apdu
 
-    # NPDU: version=0x01, control=0x04 (destination present, expecting reply)
-    npdu = bytes([0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
 
-    # For Who-Is (unconfirmed request), APDU type = 0x10, service choice = 0x00
-    apdu_service = bytes([0x10, 0x00])
+def _read_bacnet_app_int(buf: bytes, offset: int, tag_number: int) -> tuple[int | None, int]:
+    """Read a BACnet application-tagged integer/enumerated value.
 
-    # Combine
-    full_npdu = npdu + apdu_service
+    Supports the normal one-, two-, four-byte and extended-length encodings used
+    in BACnet I-Am fields.  Returns (value, next_offset); on mismatch it returns
+    (None, original_offset).
+    """
+    if offset >= len(buf):
+        return None, offset
+    tag = buf[offset]
+    if tag & 0x08:  # context-specific bit set; not an application tag
+        return None, offset
+    if (tag >> 4) != tag_number:
+        return None, offset
 
-    # BVLL
-    bvlci_function = 0x0B  # Original-Broadcast-NPDU
-    bvlci_length = 4 + len(full_npdu)
-    bvll = struct.pack("!BBH", 0x81, bvlci_function, bvlci_length) + full_npdu
-
-    return bvll
+    length = tag & 0x07
+    pos = offset + 1
+    if length == 5:  # extended length follows in the next octet
+        if pos >= len(buf):
+            return None, offset
+        length = buf[pos]
+        pos += 1
+    if length <= 0 or pos + length > len(buf):
+        return None, offset
+    return int.from_bytes(buf[pos:pos + length], "big"), pos + length
 
 
 def _parse_i_am(data: bytes, addr: tuple[str, int]) -> dict[str, Any] | None:
-    """Parse a BACnet I-Am response from raw bytes. Minimal manual parser."""
+    """Parse BACnet I-Am responses.
+
+    BACnet unconfirmed service choices:
+    - I-Am = 0x00
+    - I-Have = 0x01
+    - Who-Is = 0x08
+
+    Live devices returned packets like:
+    81 0a 00 14 01 00 10 00 c4 02 00 00 66 22 05 c4 91 00 21 07
+    """
     try:
-        if len(data) < 10:
+        if len(data) < 8 or data[0] != 0x81:
+            return None
+        bvlc_len = int.from_bytes(data[2:4], "big")
+        if bvlc_len > len(data):
+            return None
+        if data[1] not in (0x0A, 0x04):  # Original-Unicast-NPDU or Forwarded-NPDU
             return None
 
-        # check BVLL header
-        if data[0] != 0x81:
+        # I-Am APDU marker: Unconfirmed-Request-PDU (0x10), service choice I-Am (0x00).
+        # Search only after the BVLC header to avoid matching length/origin fields.
+        marker = data.find(bytes([0x10, 0x00]), 4)
+        if marker < 0:
             return None
 
-        # I-Am APDU service: 0x10 0x00 is unconfirmed req, service=0 (Who-Is)
-        # I-Am response: type 0x10, service 0x00 for Who-Is
-        # Actual I-Am notification: pdu type=unconfirmed (0x10), service=0x01 (I-Am)
+        rest = data[marker + 2:]
+        device_id: int | None = None
+        vendor_id: int | None = None
+        max_apdu: int | None = None
+        segmentation = "Unknown"
 
-        # Simplified: look for I-Am marker in the payload
-        # I-Am has service 0x00 in the Who-Is case? No -
-        # BACnet I-Am is service 1 (unconfirmed request with service choice = 1)
-        # Let's try to locate it
-
-        # The I-Am APDU has format: 0x10 (unconfirmed-req) + 0x01 (I-Am) + tag-data
-        iam_markers = [pos for pos in range(len(data) - 1) if data[pos] == 0x10 and data[pos + 1] == 0x01]
-
-        for marker in iam_markers:
-            offset = marker + 2
-            if offset >= len(data):
+        # Context tag 0, length 4: object identifier. For Device object, type=8.
+        for i in range(0, max(0, len(rest) - 4)):
+            if rest[i] != 0xC4:
+                continue
+            raw_id = struct.unpack_from("!I", rest, i + 1)[0]
+            obj_type = (raw_id >> 22) & 0x3FF
+            instance = raw_id & 0x3FFFFF
+            if obj_type != 8:
                 continue
 
-            # After service choice, we have tagged data
-            # Opening tag (context 0, primitive) for device identifier
-            # BACnet Object Identifier: tag byte = 0xC4 (context 0, 4 bytes)
-            # Or might use different tagging
+            device_id = instance
+            tail = rest[i + 5:]
 
-            # Let's try to find the device identifier
-            try:
-                idx = offset
-                # Skip opening application tags until we find a BACnet Object ID
-                # Application tag 12 (0x0C) = BACnetObjectIdentifier
-                # Structure: [tag][len][data...]
-                # tag encoding: upper nibble = tag number, bit 3 = context-specific
+            pos = 0
+            max_apdu, pos = _read_bacnet_app_int(tail, pos, 2)
+            seg_value, next_pos = _read_bacnet_app_int(tail, pos, 9)
+            if seg_value is not None:
+                segmentation = str(seg_value)
+                pos = next_pos
+            vendor_id, _ = _read_bacnet_app_int(tail, pos, 2)
+            break
 
-                # Simpler approach: use bacpypes3 if available
-                from bacpypes3.apdu import IAmRequest  # type: ignore[import-untyped]
-                from bacpypes3.pdu import PDU  # type: ignore[import-untyped]
+        if device_id is None:
+            return None
 
-                try:
-                    iam = IAmRequest()
-                    iam.decode(PDU(data[marker:]))
-                    device_id = int(iam.iAmDeviceIdentifier[1]) if iam.iAmDeviceIdentifier else None
-                    vendor_id = int(iam.vendorID) if iam.vendorID is not None else None
-                    return {
-                        "device_id": device_id,
-                        "vendor_id": vendor_id,
-                        "vendor_name": BACNET_VENDORS.get(vendor_id, "Unknown") if vendor_id else "Unknown",
-                        "segmentation": str(iam.segmentationSupported) if iam.segmentationSupported else "Unknown",
-                        "max_apdu": int(iam.maxAPDULengthAccepted) if iam.maxAPDULengthAccepted else None,
-                        "ip": addr[0],
-                        "port": addr[1],
-                    }
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        # Fallback: simple heuristic parsing
-        # Try to find 4-byte device ID after known patterns
-        for marker in iam_markers:
-            rest = data[marker + 2:]
-            if len(rest) >= 6:
-                # Assume context tag 0xC4 (object id) or 0x24 (application tag 4 = unsigned)
-                vendor_id = None
-                device_id = None
-                for scan_pos in range(0, min(len(rest) - 3, 20)):
-                    if rest[scan_pos] in (0xC4, 0x24):
-                        raw_id = struct.unpack_from("!I", rest, scan_pos + 1)[0]
-                        # BACnet object ID: upper 10 bits = type, lower 22 bits = instance
-                        instance = raw_id & 0x3FFFFF
-                        obj_type = (raw_id >> 22) & 0x3FF
-                        if obj_type == 8:  # device object type
-                            device_id = instance
-                            # try to find vendor after device (tag 0x2A = context 2 + application)
-                            rest2 = rest[scan_pos + 5:]
-                            for vp in range(0, min(len(rest2) - 2, 10)):
-                                if rest2[vp] in (0x2A, 0x22):
-                                    vendor_id = struct.unpack_from("!H", rest2, vp + 1)[0] if rest2[vp] == 0x22 else int(rest2[vp + 1])
-                                    break
-                            break
-
-                if device_id is not None:
-                    return {
-                        "device_id": device_id,
-                        "vendor_id": vendor_id,
-                        "vendor_name": BACNET_VENDORS.get(vendor_id, "Unknown") if vendor_id else "Unknown",
-                        "segmentation": "Unknown",
-                        "max_apdu": None,
-                        "ip": addr[0],
-                        "port": addr[1],
-                    }
-
-        return None
+        return {
+            "device_id": device_id,
+            "vendor_id": vendor_id,
+            "vendor_name": BACNET_VENDORS.get(vendor_id, "Unknown") if vendor_id is not None else "Unknown",
+            "segmentation": segmentation,
+            "max_apdu": max_apdu,
+            "ip": addr[0],
+            "port": addr[1],
+        }
     except Exception:
         return None
 
 
 def _try_bacpypes_parse(data: bytes, addr: tuple[str, int]) -> dict[str, Any] | None:
-    """Try parsing I-Am using bacpypes3 library."""
+    """Optional parser. Raw parser above is the primary path for this deployment."""
     try:
-        from bacpypes3.apdu import IAmRequest
-        from bacpypes3.pdu import PDU
-    except ImportError:
+        from bacpypes3.apdu import IAmRequest  # type: ignore[import-not-found]
+        from bacpypes3.pdu import PDU  # type: ignore[import-not-found]
+    except Exception:
         return None
 
     try:
-        pdu = PDU(data)
+        marker = data.find(bytes([0x10, 0x00]))
+        pdu_data = data[marker:] if marker >= 0 else data
         iam = IAmRequest()
-        iam.decode(pdu)
+        iam.decode(PDU(pdu_data))
         vendor_id = int(iam.vendorID) if iam.vendorID is not None else None
         return {
             "device_id": int(iam.iAmDeviceIdentifier[1]) if iam.iAmDeviceIdentifier else None,
             "vendor_id": vendor_id,
-            "vendor_name": BACNET_VENDORS.get(vendor_id, "Unknown") if vendor_id else "Unknown",
+            "vendor_name": BACNET_VENDORS.get(vendor_id, "Unknown") if vendor_id is not None else "Unknown",
             "segmentation": str(iam.segmentationSupported) if iam.segmentationSupported else "Unknown",
             "max_apdu": int(iam.maxAPDULengthAccepted) if iam.maxAPDULengthAccepted else None,
             "ip": addr[0],
@@ -326,78 +277,95 @@ def _try_bacpypes_parse(data: bytes, addr: tuple[str, int]) -> dict[str, Any] | 
         return None
 
 
-# ── Passive BACnet discovery ────────────────────────────────────────────────
+def _open_bacnet_udp_socket(local_ip: str, progress_cb: Callable[[int, str], None] | None = None) -> socket.socket:
+    """Open a UDP socket for BACnet discovery with safe fallbacks.
 
-
-async def _passive_bacnet_discovery(
-    timeout: float = 2.0,
-    progress_cb: Callable[[int, str], None] | None = None,
-) -> list[dict[str, Any]]:
+    Preferred source is local_ip:47808, but Windows often fails if the selected
+    NIC/IP differs or another BACnet tool owns 47808. Falling back to an
+    ephemeral source port keeps the server responsive and still receives most
+    direct I-Am replies because devices reply to the UDP source endpoint.
     """
-    Passive BACnet discovery:
-      - Optionally sends a single Who-Is UDP broadcast.
-      - Listens on UDP 47808 for I-Am responses.
-      - Deduplicates by device_id.
-    """
-    mode = _get_bacnet_discovery()
-    send_whois = mode in ("whois", "full")
-    listen_only = mode == "listen"
-
-    discovered: dict[int, dict[str, Any]] = {}  # device_id -> device
-
-    networks = _get_configured_networks()
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    bind_candidates = [
+        (local_ip, 47808),
+        ("0.0.0.0", 47808),
+        (local_ip, 0),
+        ("0.0.0.0", 0),
+    ]
+    last_error: Exception | None = None
+    for bind_addr in bind_candidates:
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.settimeout(timeout)
-            sock.bind(("0.0.0.0", 47808))
+            sock.bind(bind_addr)
+            sock.settimeout(0.25)
+            if progress_cb:
+                actual_ip, actual_port = sock.getsockname()[:2]
+                progress_cb(6, f"BACnet socket bound on {actual_ip}:{actual_port}")
+            return sock
+        except Exception as exc:
+            last_error = exc
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+    raise RuntimeError(f"Could not bind BACnet UDP socket: {last_error}")
 
+
+def _blocking_bacnet_discovery(
+    timeout: float,
+    progress_cb: Callable[[int, str], None] | None = None,
+    send_whois: bool = False,
+) -> list[dict[str, Any]]:
+    """Blocking BACnet socket work. Always run via asyncio.to_thread()."""
+    local_ip = _local_bacnet_ip()
+    networks = _discover_local_networks()
+    discovered: dict[int, dict[str, Any]] = {}
+
+    try:
+        with _open_bacnet_udp_socket(local_ip, progress_cb) as sock:
+            whois_pkt = _build_whois_packet()
             if send_whois:
-                whois_pkt = _build_whois_packet()
-                for net_idx, network in enumerate(networks):
-                    if progress_cb:
-                        pct = 10 + (net_idx * 30 // max(len(networks), 1))
-                        progress_cb(pct, f"Sending BACnet Who-Is on {network}")
+                for idx, network in enumerate(networks):
                     bcast_addr = str(network.broadcast_address)
-                    for _ in range(2):
+                    if progress_cb:
+                        pct = 10 + (idx * 20 // max(len(networks), 1))
+                        progress_cb(pct, f"Sending BACnet Who-Is to {bcast_addr}:47808")
+                    for _ in range(3):
                         try:
                             sock.sendto(whois_pkt, (bcast_addr, 47808))
                         except OSError:
                             pass
-                        await asyncio.sleep(0.05)
-            elif listen_only and progress_cb:
-                progress_cb(10, "Listening for BACnet I-Am traffic on UDP 47808")
+                        time.sleep(0.1)
 
-            start = time.time()
-            while time.time() - start < timeout:
+            if progress_cb:
+                progress_cb(30, "Listening for BACnet I-Am responses")
+
+            deadline = time.monotonic() + max(0.1, timeout)
+            while time.monotonic() < deadline:
                 try:
                     data, addr = sock.recvfrom(4096)
                 except socket.timeout:
+                    continue
+                except OSError:
                     break
 
-                device = _try_bacpypes_parse(data, addr)
+                device = _parse_i_am(data, addr)
                 if device is None:
-                    device = _parse_i_am(data, addr)
+                    device = _try_bacpypes_parse(data, addr)
                 if device is None:
                     continue
 
-                # deduplicate by device_id
                 dev_id = device.get("device_id")
-                if dev_id is not None and dev_id not in discovered:
-                    discovered[dev_id] = device
-                elif dev_id is not None:
-                    # keep first seen, update IP if different
-                    existing = discovered[dev_id]
-                    if existing.get("ip") != device.get("ip"):
-                        existing["additional_ips"] = list(
-                            set(existing.get("additional_ips", []) + [device.get("ip", "")])
-                        )
-    except OSError:
-        pass
-    except Exception:
-        pass
+                if dev_id is None:
+                    continue
+                discovered[int(dev_id)] = device
+
+    except Exception as exc:
+        if progress_cb:
+            progress_cb(50, f"BACnet discovery error: {exc}")
 
     if progress_cb:
         progress_cb(50, f"Discovered {len(discovered)} BACnet devices")
@@ -405,498 +373,311 @@ async def _passive_bacnet_discovery(
     return list(discovered.values())
 
 
-# ── Full active BACnet discovery (with ReadProperty) ────────────────────────
+async def _passive_bacnet_discovery(
+    timeout: float = 5.0,
+    progress_cb: Callable[[int, str], None] | None = None,
+    send_whois: bool = False,
+) -> list[dict[str, Any]]:
+    """Listen for BACnet/IP I-Am responses without blocking Uvicorn.
+
+    send_whois is intentionally False for passive mode.  Active/full scans set
+    it to True unless SENTRI_OT_BACNET_DISCOVERY=listen.
+    """
+    if progress_cb:
+        action = "Who-Is discovery" if send_whois else "listen-only discovery"
+        progress_cb(5, f"Preparing BACnet {action} on preferred NIC {_local_bacnet_ip()}")
+    return await asyncio.to_thread(_blocking_bacnet_discovery, timeout, progress_cb, send_whois)
 
 
-async def _active_bacnet_read_property(
-    ip: str, device_id: int, property_id: int = 85
-) -> str | None:
-    """Attempt to ReadProperty from a BACnet device. Returns value or None."""
-    return None  # placeholder — requires full BACnet stack for ReadProperty
+async def _active_bacnet_read_property(device: dict[str, Any]) -> dict[str, Any]:
+    """Placeholder for future point/object reads. Discovery-only demo remains safe."""
+    return {**device, "objects": [], "points_count": 0}
 
 
 async def _full_bacnet_discovery(
-    timeout: float = 3.0,
+    timeout: float = 5.0,
     progress_cb: Callable[[int, str], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Who-Is + ReadPropertyMultiple for points discovery."""
-    devices = await _passive_bacnet_discovery(timeout, progress_cb)
-
-    if progress_cb:
-        progress_cb(60, f"Reading properties from {len(devices)} devices")
-
-    for i, device in enumerate(devices):
-        dev_ip = device.get("ip", "")
-        dev_id = device.get("device_id")
-        if dev_ip and dev_id:
-            fw = await _active_bacnet_read_property(dev_ip, dev_id)
-            if fw:
-                device["firmware_version"] = fw
-
-        if progress_cb:
-            progress_cb(60 + (i * 20 // max(len(devices), 1)), f"Probed device {i+1}/{len(devices)}")
-
-    return devices
+    devices = await _passive_bacnet_discovery(
+        timeout=timeout,
+        progress_cb=progress_cb,
+        send_whois=_get_bacnet_discovery() != "listen",
+    )
+    enriched: list[dict[str, Any]] = []
+    for dev in devices:
+        enriched.append(await _active_bacnet_read_property(dev))
+    return enriched
 
 
-# ── Active mode extras ──────────────────────────────────────────────────────
-
-
-async def _active_tcp_port_scan(
-    ip: str, ports: list[int], timeout: float = 0.3
-) -> list[int]:
-    """Rate-limited sequential TCP port scan."""
+async def _active_tcp_port_scan(ip: str, ports: list[int] | None = None, timeout: float = 0.25) -> list[int]:
+    """Non-blocking lightweight TCP check for explicitly selected active mode."""
+    ports = ports or [47808, 502, 4840]
     open_ports: list[int] = []
     for port in ports:
         try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port), timeout=timeout
-            )
+            _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
             writer.close()
             await writer.wait_closed()
             open_ports.append(port)
-        except (OSError, asyncio.TimeoutError):
-            continue
+        except Exception:
+            pass
     return open_ports
 
 
-async def _active_scan_host(
-    ip: str,
-    bacnet_devices: dict[str, dict[str, Any]],
-    scan_ports: bool = False,
-    scan_modbus: bool = False,
-) -> dict[str, Any] | None:
-    """Scan a single host in active mode for non-BACnet protocols."""
-    open_ports: list[int] = []
-    if scan_ports:
-        tcp_ports = [22, 80, 443, 502, 4840, 44818]
-        open_ports = await _active_tcp_port_scan(ip, tcp_ports)
-
-    if ip in bacnet_devices:
-        # Already handled by BACnet
+async def _active_scan_host(ip: str) -> dict[str, Any] | None:
+    ports = await _active_tcp_port_scan(ip)
+    if not ports:
         return None
-
-    if not open_ports:
-        return None
-
-    protocols = []
-    port_proto_map = {
-        47808: "BACnet", 502: "Modbus", 4840: "OPC-UA",
-        443: "HTTPS", 80: "HTTP", 22: "SSH", 44818: "EtherNet/IP",
-    }
-    for p in open_ports:
-        proto = port_proto_map.get(p)
-        if proto and proto not in protocols:
-            protocols.append(proto)
-
-    return {
-        "ip": ip,
-        "open_ports": open_ports,
-        "protocols": protocols,
-    }
-
-
-# ── Asset building ──────────────────────────────────────────────────────────
-
-
-VULN_DETAILS = [
-    {
-        "id": "VULN-BAC-001",
-        "title": "BACnet/IP Plaintext Communication",
-        "severity": "High",
-        "cvss": 7.5,
-        "description": "BACnet/IP uses no encryption, exposing device identifiers and points over the network.",
-        "recommendation": "Segment BACnet traffic using VLANs or deploy BACnet/SC for encrypted tunnels.",
-        "control_mappings": ["SCP-01", "SCP-02", "IEC 62443-3-3 SR 4.1"],
-    },
-    {
-        "id": "VULN-BAC-002",
-        "title": "No BACnet Authentication",
-        "severity": "High",
-        "cvss": 7.5,
-        "description": "BACnet has no built-in authentication; any device on the network can issue commands.",
-        "recommendation": "Use BACnet/SC with TLS, or implement network-layer ACLs per zone.",
-        "control_mappings": ["IAM-02", "IEC 62443-3-3 SR 1.1"],
-    },
-    {
-        "id": "VULN-BAC-003",
-        "title": "Default Vendor Credentials Exposed",
-        "severity": "Critical",
-        "cvss": 9.1,
-        "description": "BACnet device does not require authentication, default credentials may be in use.",
-        "recommendation": "Rotate all default credentials and implement device-level authentication.",
-        "control_mappings": ["IAM-02", "IEC 62443-3-3 SR 1.1"],
-    },
-    {
-        "id": "VULN-BAC-004",
-        "title": "Unpatched Firmware Vulnerability",
-        "severity": "High",
-        "cvss": 8.2,
-        "description": "BACnet device firmware may contain known vulnerabilities.",
-        "recommendation": "Update firmware through approved OT maintenance window.",
-        "control_mappings": ["AST-03", "IEC 62443-3-3 SR 3.2"],
-    },
-    {
-        "id": "VULN-BAC-005",
-        "title": "Missing Network Segmentation",
-        "severity": "Medium",
-        "cvss": 5.5,
-        "description": "BACnet device not properly segmented from IT or other OT zones.",
-        "recommendation": "Map device into appropriate Purdue model security zone.",
-        "control_mappings": ["NWS-01", "IEC 62443-3-3 SR 2.8"],
-    },
-]
+    return _build_active_asset(ip, ports)
 
 
 def _build_bacnet_asset(device: dict[str, Any]) -> dict[str, Any]:
-    """Build a full asset dict from a parsed BACnet device."""
-    vendor_id = device.get("vendor_id", 0)
-    vendor_name = device.get("vendor_name", BACNET_VENDORS.get(vendor_id, "Unknown"))
-    device_id = device.get("device_id")
-    ip = device.get("ip", "0.0.0.0")
-    hostname = _resolve_hostname(ip)
-    zone = _infer_zone(ip)
-
-    vulnerabilities = []
-    # BAC-001: always present for BACnet/IP
-    vulnerabilities.append({**VULN_DETAILS[0], "protocol": "BACnet/IP"})
-    # BAC-002: no auth
-    vulnerabilities.append({**VULN_DETAILS[1], "protocol": "BACnet/IP"})
-    # BAC-003: random chance
-    if random.random() > 0.5:
-        vulnerabilities.append({**VULN_DETAILS[2], "protocol": "BACnet/IP"})
-    # BAC-005: depending on zone
-    if zone not in ("Zone 1", "Zone 2"):
-        vulnerabilities.append({**VULN_DETAILS[4], "protocol": "BACnet/IP"})
-
-    object_count = random.randint(50, 500)
-    asset = {
-        "id": str(uuid.uuid4()),
-        "hostname": hostname or f"bms-device-{device_id}",
-        "ip": ip,
-        "device_type": "BMS Controller",
-        "device_id": device_id,
-        "vendor_id": vendor_id,
-        "vendor_name": vendor_name,
-        "firmware_version": device.get("firmware_version", f"{random.randint(1,5)}.{random.randint(0,9)}.{random.randint(0,99)}"),
-        "protocols": ["BACnet/IP"],
-        "protocol": "BACnet/IP",
-        "protocol_version": f"BACnet {device.get('protocol_version', '1.4')}",
-        "ports": [47808],
-        "criticality": "High" if zone in ("Zone 0", "Zone 1") else "Medium",
-        "risk_level": _risk_level(vulnerabilities),
-        "segmentation_zone": zone,
-        "auth_method": "None",
-        "object_count": object_count,
-        "last_seen": datetime.now(timezone.utc).isoformat(),
-        "security_status": "Monitored",
-        "vulnerabilities": vulnerabilities,
-    }
-    return asset
-
-
-def _build_active_asset(
-    scan_result: dict[str, Any], bacnet_device: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    """Build an asset from active-mode scan results (non-BACnet)."""
-    ip = scan_result["ip"]
-    protocols = scan_result.get("protocols", [])
-    ports = scan_result.get("open_ports", [])
-    hostname = _resolve_hostname(ip)
-    zone = _infer_zone(ip)
-
-    DEVICE_TYPE_MAP = {
-        "Modbus": ("PLC", "Critical"),
-        "OPC-UA": ("Historian", "High"),
-        "HTTPS": ("Engineering Workstation", "High"),
-        "HTTP": ("Web Management", "Medium"),
-        "SSH": ("Remote Maintenance Host", "Medium"),
-        "EtherNet/IP": ("EtherNet/IP Device", "High"),
-    }
-
-    primary = protocols[0] if protocols else "Unknown"
-    dtype, dcrit = DEVICE_TYPE_MAP.get(primary, ("OT Asset", "Medium"))
-
-    vulns = []
-    if not protocols:
-        pass
-    elif "Modbus" in protocols or "BACnet" in protocols:
-        vulns.append({
-            "id": "VULN-ACT-001",
-            "title": f"Unencrypted {primary} Protocol",
-            "severity": "High",
-            "cvss": 7.5,
-            "description": f"{primary} traffic observed without encryption.",
-            "recommendation": "Segment traffic and use encrypted tunnels.",
-            "control_mappings": ["SCP-01", "IEC 62443-3-3 SR 4.1"],
-        })
-    if "HTTP" in protocols:
-        vulns.append({
-            "id": "VULN-ACT-002",
-            "title": "Unencrypted HTTP Management Interface",
+    ip = str(device.get("ip", ""))
+    vendor_id = device.get("vendor_id")
+    vendor_name = device.get("vendor_name") or (BACNET_VENDORS.get(vendor_id, "Unknown") if vendor_id is not None else "Unknown")
+    vulnerabilities = [
+        {
+            "id": "BACNET-IP-OPEN",
             "severity": "Medium",
-            "cvss": 5.5,
-            "description": "Web management exposed over plain HTTP.",
-            "recommendation": "Enforce HTTPS with valid certificates.",
-            "control_mappings": ["IAM-02", "IEC 62443-3-3 SR 1.1"],
-        })
+            "title": "BACnet/IP service exposed on UDP/47808",
+            "description": "BACnet/IP devices commonly expose discovery and management services without authentication.",
+            "recommendation": "Restrict BACnet/IP to the BMS VLAN, monitor Who-Is/I-Am traffic, and control routed access via BBMD/firewall policy.",
+            "protocol": "BACnet/IP",
+        }
+    ]
+
+    device_id = device.get("device_id")
+    now = _utc_now()
+    return {
+        "id": f"bacnet-{device_id or ip}",
+        "asset_id": f"bacnet-{device_id or ip}",
+        "name": f"BACnet Device {device_id}" if device_id is not None else f"BACnet Device {ip}",
+        "hostname": _resolve_hostname(ip) if ip else "Unknown",
+        "ip": ip,
+        "ip_address": ip,
+        "mac": None,
+        "protocol": "BACnet/IP",
+        "protocols": ["BACnet/IP"],
+        "ports": [47808],
+        "device_type": "BACnet Device",
+        "type": "BMS Controller",
+        "vendor": vendor_name,
+        "vendor_id": vendor_id,
+        "device_id": device_id,
+        "model": "Unknown",
+        "firmware": "Unknown",
+        "firmware_version": "Unknown",
+        "segmentation": device.get("segmentation", "Unknown"),
+        "max_apdu": device.get("max_apdu"),
+        "zone": _infer_zone(ip),
+        "criticality": "Medium",
+        "risk_level": _risk_level(vulnerabilities),
+        "vulnerabilities": vulnerabilities,
+        "status": "online",
+        "security_status": "Monitored",
+        "last_seen": now,
+        "discovered_at": now,
+        "segmentation_zone": _infer_zone(ip),
+        "auth_method": "None",
+        "vendor_name": vendor_name,
+        "object_count": device.get("points_count", 0),
+        "objects": device.get("objects", []),
+        "points_count": device.get("points_count", 0),
+        "metadata": device,
+    }
+
+
+def _build_active_asset(ip: str, ports: list[int]) -> dict[str, Any]:
+    now = _utc_now()
+    protocols = []
+    if 47808 in ports:
+        protocols.append("BACnet/IP")
+    if 502 in ports:
+        protocols.append("Modbus/TCP")
+    if 4840 in ports:
+        protocols.append("OPC-UA")
+    return {
+        "id": f"host-{ip}",
+        "asset_id": f"host-{ip}",
+        "name": f"OT Host {ip}",
+        "hostname": _resolve_hostname(ip),
+        "ip": ip,
+        "ip_address": ip,
+        "protocol": protocols[0] if protocols else "Unknown",
+        "protocols": protocols,
+        "ports": ports,
+        "device_type": "OT Host",
+        "type": "OT Host",
+        "vendor": "Unknown",
+        "zone": _infer_zone(ip),
+        "criticality": "Medium",
+        "risk_level": "Medium" if ports else "Low",
+        "vulnerabilities": [],
+        "status": "online",
+        "last_seen": now,
+        "discovered_at": now,
+    }
+
+
+async def _run_passive_scan(progress_cb: Callable[[int, str], None] | None = None) -> list[dict[str, Any]]:
+    devices = await _passive_bacnet_discovery(timeout=5.0, progress_cb=progress_cb, send_whois=False)
+    return [_build_bacnet_asset(d) for d in devices]
+
+
+async def _run_active_scan(progress_cb: Callable[[int, str], None] | None = None) -> list[dict[str, Any]]:
+    # Safe active mode: start with BACnet discovery that is known to work.
+    devices = await _full_bacnet_discovery(timeout=5.0, progress_cb=progress_cb)
+    assets = [_build_bacnet_asset(d) for d in devices]
+
+    # Optional lightweight TCP check only when explicitly active/full.
+    networks = _discover_local_networks()
+    if _get_mode() == "active":
+        for network in networks:
+            # Cap to avoid scanning entire large networks by accident; do not materialize huge networks.
+            for idx, ip in enumerate(network.hosts()):
+                if idx >= 254:
+                    break
+                if progress_cb and idx % 25 == 0:
+                    progress_cb(55, f"Optional TCP OT check on {ip}")
+                asset = await _active_scan_host(str(ip))
+                if asset and not any(a.get("ip") == asset.get("ip") for a in assets):
+                    assets.append(asset)
+    return assets
+
+
+def _build_simulated_assets(count: int = 20) -> list[dict[str, Any]]:
+    assets = []
+    for i in range(count):
+        ip = f"192.168.1.{100 + i}"
+        assets.append(_build_bacnet_asset({
+            "device_id": 100 + i,
+            "vendor_id": random.choice([5, 7, 42, 65, 95]),
+            "vendor_name": "Simulated Vendor",
+            "segmentation": "Unknown",
+            "max_apdu": 1476,
+            "ip": ip,
+            "port": 47808,
+        }))
+    return assets
+
+
+def _compute_summary(assets: list[dict[str, Any]]) -> dict[str, Any]:
+    protocols = Counter()
+    vendors = Counter()
+    zones = Counter()
+    risk = Counter()
+    for asset in assets:
+        for proto in asset.get("protocols", []) or [asset.get("protocol", "Unknown")]:
+            protocols[proto or "Unknown"] += 1
+        vendors[asset.get("vendor", "Unknown")] += 1
+        zones[asset.get("zone", "Unknown")] += 1
+        risk[asset.get("risk_level", "unknown")] += 1
 
     return {
-        "id": str(uuid.uuid4()),
-        "hostname": hostname or ip,
-        "ip": ip,
-        "device_type": dtype,
-        "protocols": protocols,
-        "protocol": primary,
-        "ports": ports,
-        "criticality": dcrit,
-        "risk_level": _risk_level(vulns),
-        "segmentation_zone": zone,
-        "auth_method": "Unknown",
-        "firmware_version": f"{random.randint(1,5)}.{random.randint(0,9)}.{random.randint(0,99)}",
-        "last_seen": datetime.now(timezone.utc).isoformat(),
-        "security_status": "Monitored" if random.random() > 0.2 else "Unmonitored",
-        "vulnerabilities": vulns,
-        "vendor_id": 0,
-        "vendor_name": "",
-        "object_count": 0,
+        "total_assets": len(assets),
+        "protocols": dict(protocols),
+        "vendors": dict(vendors),
+        "zones": dict(zones),
+        "risk_levels": dict(risk),
+        "online_assets": sum(1 for a in assets if a.get("status") == "online"),
+        "bacnet_devices": sum(1 for a in assets if "BACnet/IP" in (a.get("protocols") or [])),
     }
-
-
-# ── Main scan orchestration ─────────────────────────────────────────────────
 
 
 async def scan_environment_async(
     asset_count: int | None = None,
     progress_cb: Callable[[int, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Run environment scan based on SENTRI_OT_SCAN_MODE.
-
-    Returns the full scan result dict compatible with compliance_framework.py.
-    """
+    """Run environment scan based on SENTRI_OT_SCAN_MODE."""
     mode = _get_mode()
-    if mode == "simulate":
-        from backend.ot_simulator import simulate_network_scan
-        if progress_cb:
-            progress_cb(20, "Generating simulated OT environment")
-        result = simulate_network_scan(asset_count)
-        if progress_cb:
-            progress_cb(90, "Evaluating compliance")
-        return result
-
-    if mode == "active":
-        return await _run_active_scan(asset_count, progress_cb)
-
-    # default: passive
-    return await _run_passive_scan(asset_count, progress_cb)
-
-
-async def _run_passive_scan(
-    asset_count: int | None = None,
-    progress_cb: Callable[[int, str], None] | None = None,
-) -> dict[str, Any]:
-    """Passive mode: BACnet Who-Is / listen only. No TCP/UDP probes."""
     scan_id = str(uuid.uuid4())
-    generated_at = datetime.now(timezone.utc).isoformat()
+    started_at = _utc_now()
 
     if progress_cb:
-        progress_cb(5, "Starting passive BACnet discovery")
+        progress_cb(1, f"Starting Sentri-OT scan in {mode} mode")
 
-    # 1. BACnet discovery
-    bacnet_device_info = await _passive_bacnet_discovery(
-        timeout=3.0,
-        progress_cb=progress_cb,
-    )
-
-    if progress_cb:
-        progress_cb(50, f"Discovered {len(bacnet_device_info)} BACnet devices")
-
-    # 2. Build assets
-    assets = []
-    for device in bacnet_device_info:
-        asset = _build_bacnet_asset(device)
-        assets.append(asset)
-
-    if progress_cb:
-        progress_cb(70, f"Built {len(assets)} asset records")
-
-    # 3. Compute summary
-    if not assets and progress_cb:
-        progress_cb(90, "No devices discovered. Network may not have BACnet traffic.")
+    if mode == "simulate":
+        assets = _build_simulated_assets(asset_count or 20)
+    elif mode == "active":
+        assets = await _run_active_scan(progress_cb=progress_cb)
+    else:
+        assets = await _run_passive_scan(progress_cb=progress_cb)
 
     summary = _compute_summary(assets)
-    scan_result = {
+    compliance_score = 0
+
+    result: dict[str, Any] = {
         "scan_id": scan_id,
-        "generated_at": generated_at,
-        "scan_type": "passive",
+        "generated_at": started_at,
+        "scan_type": mode,
         "status": "complete",
+        "progress": 100,
+        "message": "Scan complete",
+        "started_at": started_at,
+        "completed_at": _utc_now(),
         "assets": assets,
-        "summary": summary,
-    }
-
-    # 4. Compliance + alerts
-    if progress_cb:
-        progress_cb(85, "Evaluating compliance against DESC & IEC 62443")
-    scan_result["compliance"] = run_compliance_check(scan_result)
-    scan_result["alerts"] = run_alert_feed(scan_result)
-
-    if progress_cb:
-        progress_cb(100, "Passive scan complete")
-
-    return scan_result
-
-
-async def _run_active_scan(
-    asset_count: int | None = None,
-    progress_cb: Callable[[int, str], None] | None = None,
-) -> dict[str, Any]:
-    """Active mode: full discovery with port scanning and Modbus probing."""
-    scan_id = str(uuid.uuid4())
-    generated_at = datetime.now(timezone.utc).isoformat()
-
-    if progress_cb:
-        progress_cb(5, "Starting active discovery")
-
-    # 1. BACnet discovery (Who-Is + optionally ReadProperty)
-    discovery_mode = _get_bacnet_discovery()
-    if discovery_mode == "full":
-        bacnet_devices = await _full_bacnet_discovery(timeout=3.0, progress_cb=progress_cb)
-    else:
-        bacnet_devices = await _passive_bacnet_discovery(timeout=3.0, progress_cb=progress_cb)
-
-    bacnet_by_ip: dict[str, dict[str, Any]] = {
-        d["ip"]: d for d in bacnet_devices if d.get("ip")
-    }
-
-    if progress_cb:
-        progress_cb(55, f"Discovered {len(bacnet_devices)} BACnet devices")
-
-    # 2. Port scan + active probing on discovered networks
-    networks = _get_configured_networks()
-    active_results: list[dict[str, Any]] = []
-
-    # Sample hosts from networks (limit for active mode)
-    hosts_to_scan = []
-    for net in networks:
-        for i, ip in enumerate(net.hosts()):
-            str_ip = str(ip)
-            if str_ip not in bacnet_by_ip and len(hosts_to_scan) < (asset_count or 30):
-                hosts_to_scan.append(str_ip)
-            if len(hosts_to_scan) >= (asset_count or 30):
-                break
-
-    if progress_cb:
-        progress_cb(60, f"Scanning {len(hosts_to_scan)} hosts for open ports (rate-limited)")
-
-    for idx, host in enumerate(hosts_to_scan):
-        result = await _active_scan_host(
-            host, bacnet_by_ip, scan_ports=True, scan_modbus=True
-        )
-        if result:
-            asset = _build_active_asset(result, bacnet_by_ip.get(host))
-            active_results.append(asset)
-
-        if progress_cb and idx % 10 == 0:
-            progress_cb(
-                60 + (idx * 25 // max(len(hosts_to_scan), 1)),
-                f"Active scan progress: {idx+1}/{len(hosts_to_scan)}",
-            )
-
-    # Build BACnet assets
-    bacnet_assets = [_build_bacnet_asset(d) for d in bacnet_devices]
-
-    if progress_cb:
-        progress_cb(85, "Combining all results")
-
-    all_assets = bacnet_assets + active_results
-
-    summary = _compute_summary(all_assets)
-    scan_result = {
-        "scan_id": scan_id,
-        "generated_at": generated_at,
-        "scan_type": "active",
-        "status": "complete",
-        "assets": all_assets,
-        "summary": summary,
-    }
-
-    if progress_cb:
-        progress_cb(90, "Evaluating compliance")
-    scan_result["compliance"] = run_compliance_check(scan_result)
-    scan_result["alerts"] = run_alert_feed(scan_result)
-
-    if progress_cb:
-        progress_cb(100, "Active scan complete")
-
-    return scan_result
-
-
-# ── Summary computation ─────────────────────────────────────────────────────
-
-
-def _compute_summary(assets: list[dict[str, Any]]) -> dict[str, Any]:
-    """Compute aggregated summary stats from a list of assets."""
-    vulnerability_counts: Counter = Counter()
-    protocol_counts: Counter = Counter()
-    zone_counts: Counter = Counter()
-    device_type_counts: Counter = Counter()
-    vendor_counts: Counter = Counter()
-    total_objects = 0
-
-    for asset in assets:
-        for v in asset.get("vulnerabilities", []):
-            vulnerability_counts[v.get("severity", "Low")] += 1
-        for p in asset.get("protocols", []):
-            if p:
-                protocol_counts[p] += 1
-        zone = asset.get("segmentation_zone", "Unknown")
-        if zone:
-            zone_counts[zone] += 1
-        dt = asset.get("device_type", "Unknown")
-        if dt:
-            device_type_counts[dt] += 1
-        vendor = asset.get("vendor_name", "")
-        if vendor and vendor != "Unknown":
-            vendor_counts[vendor] += 1
-        total_objects += asset.get("object_count", 0)
-
-    total_vulns = sum(vulnerability_counts.values())
-    critical_vulns = vulnerability_counts.get("Critical", 0)
-
-    risk_penalty = min(
-        72,
-        critical_vulns * 10
-        + vulnerability_counts.get("High", 0) * 5
-        + vulnerability_counts.get("Medium", 0) * 2,
-    )
-    compliance_score = max(30, 98 - risk_penalty)
-
-    return {
+        "devices": assets,
         "total_assets": len(assets),
-        "total_vulnerabilities": total_vulns,
-        "critical_vulnerabilities": critical_vulns,
+        "devices_found": len(assets),
+        "summary": summary,
         "compliance_score": compliance_score,
-        "vulnerabilities_by_severity": {
-            severity: vulnerability_counts.get(severity, 0)
-            for severity in ["Critical", "High", "Medium", "Low"]
-        },
-        "protocols_discovered": dict(protocol_counts),
-        "zones_discovered": dict(zone_counts),
-        "device_types": dict(device_type_counts),
-        "total_bacnet_objects": total_objects,
-        "top_vendors": dict(vendor_counts.most_common(10)),
     }
 
+    try:
+        result["compliance"] = run_compliance_check(result) if callable(run_compliance_check) else {"score": compliance_score}
+        if isinstance(result["compliance"], dict):
+            compliance_score = int(float(result["compliance"].get("score", compliance_score) or 0))
+            result["compliance_score"] = compliance_score
+            result["summary"]["compliance_score"] = compliance_score
+    except Exception as exc:
+        result["compliance"] = {"score": compliance_score, "error": str(exc)}
 
-# ── Sync wrapper for backwards compatibility ───────────────────────────────
+    try:
+        result["alerts"] = run_alert_feed(result) if callable(run_alert_feed) else []
+    except Exception as exc:
+        result["alerts"] = [{
+            "id": f"ALERT-SCAN-{scan_id[:8]}",
+            "timestamp": _utc_now(),
+            "severity": "Info",
+            "title": "Alert generation skipped",
+            "message": str(exc),
+            "asset_id": None,
+            "status": "Info",
+        }]
+
+    if progress_cb:
+        progress_cb(100, f"Scan complete: {len(assets)} assets discovered")
+
+    return result
 
 
 def scan_environment(asset_count: int | None = None) -> dict[str, Any]:
-    """Synchronous wrapper. Compatible with existing callers."""
-    return asyncio.run(scan_environment_async(asset_count))
+    """Synchronous wrapper for scan_environment_async."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # This path should rarely be used by FastAPI; return a clear safe result instead of crashing.
+            return {
+                "scan_id": str(uuid.uuid4()),
+                "status": "error",
+                "progress": 100,
+                "message": "scan_environment called from running event loop; use scan_environment_async",
+                "assets": [],
+                "devices": [],
+                "total_assets": 0,
+                "devices_found": 0,
+                "summary": _compute_summary([]),
+                "compliance_score": 0,
+            }
+        return loop.run_until_complete(scan_environment_async(asset_count=asset_count))
+    except RuntimeError:
+        return asyncio.run(scan_environment_async(asset_count=asset_count))
 
 
 def scan_real_ot_environment(asset_count: int | None = None) -> dict[str, Any]:
-    """Alias for scan_environment in active mode. Kept for backward compat."""
-    os.environ.setdefault("SENTRI_OT_SCAN_MODE", "active")
-    return asyncio.run(scan_environment_async(asset_count))
+    """Compatibility entry point used by older backend code."""
+    os.environ.setdefault("SENTRI_OT_SCAN_MODE", "passive")
+    os.environ.setdefault("SENTRI_OT_SCAN_NETWORKS", "192.168.1.0/24")
+    os.environ.setdefault("SENTRI_OT_BACNET_LOCAL_IP", "192.168.1.205")
+    os.environ.setdefault("SENTRI_OT_BACNET_DISCOVERY", "whois")
+    return scan_environment(asset_count=asset_count)

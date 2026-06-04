@@ -54,7 +54,7 @@ No changes to existing BMS hardware, no software on the BMS server, no network d
 ### Option 1: Docker (Recommended)
 
 ```bash
-git clone https://github.com/tush-86/flying-unicorn.git sentri-ot
+git clone https://github.com/tush-86/sentri-ot.git sentri-ot
 cd sentri-ot
 cp .env.example .env
 # Edit .env to configure networks
@@ -69,17 +69,16 @@ Open **http://localhost:8000**
 # Flash Raspberry Pi OS Lite to SD card
 # Enable SSH, connect to BMS network
 ssh pi@sentri-ot.local
-curl -sSL https://raw.githubusercontent.com/tush-86/flying-unicorn/main/scripts/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/tush-86/sentri-ot/main/scripts/install.sh | sudo bash
 ```
 
 ### Option 3: Local Development
 
 ```bash
-# Backend
-cd backend
+# Backend (run from the repository root)
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 SENTRI_OT_SCAN_MODE=simulate uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
 # Frontend (separate terminal)
@@ -132,8 +131,8 @@ Installation:
 
 | Mode | Description | BACnet Impact |
 |------|-------------|---------------|
-| `passive` | Listen only — captures existing BACnet traffic | **None.** No network packets sent |
-| `active`  | Send Who-Is broadcasts to discover controllers | Minimal — standard BACnet discovery |
+| `passive` | Listen only — captures existing BACnet I-Am traffic | **None.** No network packets sent |
+| `active`  | Send Who-Is broadcasts to discover controllers, then optional lightweight TCP checks | Minimal — standard BACnet discovery |
 | `simulate` | Generate realistic simulated BMS data | **None.** For demos and development |
 
 ---
@@ -173,8 +172,10 @@ Security Requirements SR 1.1 through SR 7.8 — Full system security requirement
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SENTRI_OT_SCAN_MODE` | `passive` | Scan mode: `passive`, `active`, or `simulate` |
-| `SENTRI_OT_SCAN_NETWORKS` | *(auto)* | CIDR networks to scan (comma-separated) |
+| `SENTRI_OT_SCAN_NETWORKS` | `192.168.1.0/24` when unset in scanner | CIDR networks to scan (comma-separated) |
 | `SENTRI_OT_SCAN_INTERVAL` | `60` | Auto-scan interval in minutes (`0` = manual only) |
+| `SENTRI_OT_BACNET_LOCAL_IP` | `192.168.1.205` | Preferred BACnet NIC/IP for the live BMS PC |
+| `SENTRI_OT_BACNET_DISCOVERY` | `whois` | Active/full discovery mode: `whois`, `listen`, or `full` |
 | `SENTRI_OT_DB_PATH` | `/data/sentri_ot.db` | SQLite database file path |
 
 ### CORS Configuration
@@ -192,27 +193,31 @@ SENTRI_OT_CORS_ORIGINS=http://localhost:5173,http://localhost:8000
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/health` | Health check |
-| `GET` | `/api/devices` | List discovered BACnet devices |
-| `GET` | `/api/devices/{id}` | Device details |
-| `POST` | `/api/scan` | Trigger an ad-hoc network scan |
-| `GET` | `/api/scans` | List scan history |
-| `GET` | `/api/compliance/overview` | Compliance status summary |
-| `GET` | `/api/compliance/desc` | DESC ICS/OT control mapping |
-| `GET` | `/api/compliance/iec62443` | IEC 62443-3-3 control mapping |
-| `GET` | `/api/reports` | List generated compliance reports |
-| `POST` | `/api/reports/generate` | Generate a compliance report (PDF) |
-| `GET` | `/api/reports/{id}/download` | Download a generated report |
+| `GET` | `/api/config` | Current scan/runtime configuration |
+| `PUT` | `/api/config` | Runtime scan configuration update |
+| `POST` | `/api/scan/start` | Trigger an ad-hoc network scan |
+| `GET` | `/api/scan/status` | Current scan status/progress |
+| `GET` | `/api/scan/latest/result` | Latest full scan result |
+| `GET` | `/api/scan/history` | List scan history |
+| `GET` | `/api/assets` | List discovered assets/devices |
+| `GET` | `/api/assets/{id}` | Asset/device details |
+| `GET` | `/api/alerts` | List alerts |
+| `GET` | `/api/compliance/latest` | Compliance status summary |
+| `GET` | `/api/compliance/frameworks` | Supported compliance frameworks |
+| `GET` | `/api/compliance/controls?framework=DESC` | Framework controls |
+| `GET` | `/api/report/pdf` | Download the latest compliance PDF |
+| Aliases | `/api/scan`, `/api/scans`, `/api/devices`, `/api/devices/{id}`, `/api/compliance/overview` | Older docs/scripts |
 
 ### Example: Trigger a scan
 
 ```bash
-curl -X POST http://localhost:8000/api/scan
+curl -X POST http://localhost:8000/api/scan/start
 ```
 
 ### Example: Get compliance overview
 
 ```bash
-curl http://localhost:8000/api/compliance/overview
+curl http://localhost:8000/api/compliance/latest
 ```
 
 ---

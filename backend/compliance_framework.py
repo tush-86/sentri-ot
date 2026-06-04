@@ -1499,6 +1499,21 @@ def _evaluate_evidence_rules(rules: dict, evidence: dict) -> str:
             continue
 
         passed = False
+        if op in {"gte", "lte", "pct", "gt", "lt"}:
+            # Evidence occasionally arrives as aggregate dictionaries from the
+            # scanner summary, e.g. {"Zone A": 3}, while controls expect a
+            # scalar count/percentage.  Convert common aggregate values before
+            # comparing so compliance evaluation never crashes a scan.
+            if isinstance(actual, dict):
+                actual = len(actual)
+            if isinstance(threshold, dict):
+                threshold = len(threshold)
+            try:
+                actual = float(actual)
+                threshold = float(threshold)
+            except (TypeError, ValueError):
+                continue
+
         if op == "gte":
             passed = actual >= threshold
         elif op == "lte":
@@ -1527,6 +1542,57 @@ def _evaluate_evidence_rules(rules: dict, evidence: dict) -> str:
         return "FAIL"
 
 
+def _summary_count(value: Any, default: int = 0) -> int:
+    """Normalize summary aggregates to a scalar count.
+
+    Scanner summaries often store breakdowns as dictionaries/counters, while the
+    compliance rules compare against numeric counts.  This helper keeps those
+    two shapes compatible.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, dict):
+        return len(value)
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _summary_bool(value: Any, default: bool = False) -> bool:
+    """Normalize summary values to booleans without treating dicts as booleans."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _summary_number(value: Any, default: float = 0) -> float:
+    """Normalize numeric summary metrics and aggregate dict/list values safely."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, dict):
+        numeric_values = [v for v in value.values() if isinstance(v, (int, float))]
+        return float(sum(numeric_values)) if numeric_values else float(len(value))
+    if isinstance(value, (list, tuple, set)):
+        return float(len(value))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_evidence_from_assets(assets: list[dict], summary: dict) -> dict:
     """Extract evidence metrics from scan data for control evaluation.
 
@@ -1540,7 +1606,7 @@ def _build_evidence_from_assets(assets: list[dict], summary: dict) -> dict:
     Returns:
         Evidence dict with keys matching evidence_rules patterns
     """
-    total = summary.get("total_assets", len(assets))
+    total = _summary_count(summary.get("total_assets"), len(assets))
 
     # Count unique devices
     unique_ips = set()
@@ -1638,62 +1704,59 @@ def _build_evidence_from_assets(assets: list[dict], summary: dict) -> dict:
             vuln_scans = True
 
     # Summary-derived evidence
-    # Network segmentation
-    zone_count = summary.get("zones_detected", summary.get("zones", 1))
-    broadcast_domains = summary.get("broadcast_domains", summary.get("subnets", 1))
-    has_cross_traffic = summary.get("it_ot_cross_traffic", summary.get("cross_zone_traffic", True))
-    if not isinstance(has_cross_traffic, bool):
-        has_cross_traffic = True
+    # Network segmentation.  The scanner uses breakdown dictionaries for zones,
+    # protocols, vendors, and risk levels; normalize those before comparing.
+    zone_count = _summary_count(summary.get("zones_detected", summary.get("zones")), 1)
+    broadcast_domains = _summary_count(summary.get("broadcast_domains", summary.get("subnets")), 1)
+    has_cross_traffic = _summary_bool(summary.get("it_ot_cross_traffic", summary.get("cross_zone_traffic")), True)
 
     # BBMD exposure
-    bbmd_exposure = summary.get("bbmd_exposure", summary.get("bbmd_exposed", False))
+    bbmd_exposure = _summary_bool(summary.get("bbmd_exposure", summary.get("bbmd_exposed")), False)
 
     # BACnet security
-    has_plaintext = summary.get("bacnet_plaintext", summary.get("plaintext", True))
-    if not isinstance(has_plaintext, bool):
-        has_plaintext = True
-    has_bacnet_secure = summary.get("bacnet_sc", summary.get("secure_connect", has_bacnet_secure))
+    has_plaintext = _summary_bool(summary.get("bacnet_plaintext", summary.get("plaintext")), True)
+    has_bacnet_secure = _summary_bool(summary.get("bacnet_sc", summary.get("secure_connect")), has_bacnet_secure)
 
     # Remote access
-    has_remote_access = summary.get("remote_access_detected", summary.get("remote_access", False))
-    has_vpn = summary.get("vpn_gateway", summary.get("vpn_detected", False))
+    has_remote_access = _summary_bool(summary.get("remote_access_detected", summary.get("remote_access")), False)
+    has_vpn = _summary_bool(summary.get("vpn_gateway", summary.get("vpn_detected")), False)
 
     # Monitoring
-    has_monitoring = summary.get("monitoring_active", summary.get("monitored", has_monitoring))
-    has_anomaly_detection = summary.get("anomaly_detection", summary.get("anomaly_detection_active", False))
-    has_event_logging = summary.get("event_logging", summary.get("logging_enabled", False))
-    has_incident_detection = summary.get("incident_detection", summary.get("ids_detected", False))
-    has_cov = summary.get("cov_subscriptions", summary.get("cov_active", has_cov))
+    has_monitoring = _summary_bool(summary.get("monitoring_active", summary.get("monitored")), has_monitoring)
+    has_anomaly_detection = _summary_bool(summary.get("anomaly_detection", summary.get("anomaly_detection_active")), False)
+    has_event_logging = _summary_bool(summary.get("event_logging", summary.get("logging_enabled")), False)
+    has_incident_detection = _summary_bool(summary.get("incident_detection", summary.get("ids_detected")), False)
+    has_cov = _summary_bool(summary.get("cov_subscriptions", summary.get("cov_active")), has_cov)
 
     # Network controls
-    has_acls = summary.get("acls_detected", summary.get("firewall_rules", False))
-    has_port_restriction = summary.get("bacnet_port_restricted", summary.get("port_restriction", False))
-    has_unexpected_ports = summary.get("unexpected_ports", False)
-    has_redundant_paths = summary.get("redundant_paths", summary.get("redundancy", False))
-    redundant_controllers = summary.get("bacnet_redundant_controllers", 0)
+    has_acls = _summary_bool(summary.get("acls_detected", summary.get("firewall_rules")), False)
+    has_port_restriction = _summary_bool(summary.get("bacnet_port_restricted", summary.get("port_restriction")), False)
+    has_unexpected_ports = _summary_bool(summary.get("unexpected_ports"), False)
+    has_redundant_paths = _summary_bool(summary.get("redundant_paths", summary.get("redundancy")), False)
+    redundant_controllers = _summary_count(summary.get("bacnet_redundant_controllers"), 0)
 
     # Config
-    has_session_timeouts = summary.get("session_timeouts", False)
-    has_password_policy = summary.get("password_policy", False)
-    has_log_retention = summary.get("log_retention", False)
-    has_device_auth = summary.get("device_authentication", False)
-    has_cert_mgmt = summary.get("certificate_management", False)
-    has_encryption_strength = summary.get("encryption_strength", False)
-    has_network_hardening = summary.get("network_hardening", False)
-    has_bacnet_baseline = summary.get("traffic_baseline", False)
-    has_backup_policy = summary.get("backup_policy", False)
+    has_session_timeouts = _summary_bool(summary.get("session_timeouts"), False)
+    has_password_policy = _summary_bool(summary.get("password_policy"), False)
+    has_log_retention = _summary_bool(summary.get("log_retention"), False)
+    has_device_auth = _summary_bool(summary.get("device_authentication"), False)
+    has_cert_mgmt = _summary_bool(summary.get("certificate_management"), False)
+    has_encryption_strength = _summary_bool(summary.get("encryption_strength"), False)
+    has_network_hardening = _summary_bool(summary.get("network_hardening"), False)
+    has_bacnet_baseline = _summary_bool(summary.get("traffic_baseline"), False)
+    has_backup_policy = _summary_bool(summary.get("backup_policy"), False)
 
     # Stats
     vendor_uniform = len(vendors_found)
-    unique_users = summary.get("unique_users", summary.get("user_count", 0))
-    user_roles = summary.get("user_roles", summary.get("role_count", 1))
-    auth_mechs = summary.get("auth_mechanisms", 1)
-    encryption_count = summary.get("encryption_mechanisms", 0)
-    bacnet_protocol_anomalies = summary.get("protocol_anomalies", False)
-    outdated_firmware = summary.get("outdated_firmware", summary.get("outdated_devices", False))
-    vulnerable_protocols = summary.get("vulnerable_protocols", False)
-    bacnet_vendor_uniformity = summary.get("vendor_uniformity_pct", vendor_uniform * 25 if vendor_uniform > 0 else 0)
-    secure_config_pct = summary.get("secure_config_pct", summary.get("secure_config", 50))
+    unique_users = _summary_count(summary.get("unique_users", summary.get("user_count")), 0)
+    user_roles = _summary_count(summary.get("user_roles", summary.get("role_count")), 1)
+    auth_mechs = _summary_count(summary.get("auth_mechanisms"), 1)
+    encryption_count = _summary_count(summary.get("encryption_mechanisms"), 0)
+    bacnet_protocol_anomalies = _summary_bool(summary.get("protocol_anomalies"), False)
+    outdated_firmware = _summary_bool(summary.get("outdated_firmware", summary.get("outdated_devices")), False)
+    vulnerable_protocols = _summary_bool(summary.get("vulnerable_protocols"), False)
+    bacnet_vendor_uniformity = _summary_number(summary.get("vendor_uniformity_pct"), vendor_uniform * 25 if vendor_uniform > 0 else 0)
+    secure_config_pct = _summary_number(summary.get("secure_config_pct", summary.get("secure_config")), 50)
 
     # Build evidence dict
     evidence = {
