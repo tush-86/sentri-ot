@@ -601,7 +601,7 @@ def _read_property_sync(
     timeout: float = 2.0,
 ) -> str | int | None:
     """Send ReadProperty and parse the Complex-ACK response."""
-    req = _build_read_property_request(device_instance, property_id)
+    req = _build_read_property_multiple_request(device_instance, [property_id])
     try:
         sock.sendto(req, (ip, 47808))
         saved = sock.gettimeout()
@@ -724,7 +724,7 @@ def _read_object_names_sync(
     # Step 1: read the first chunk of the object-list
     # Most controllers return the array opening tag with elements inline.
     # We read the raw response and look for ObjectIdentifier values.
-    req = _build_read_property_request(device_instance, BACNET_PROP_OBJECT_LIST)
+    req = _build_read_property_multiple_request(device_instance, [BACNET_PROP_OBJECT_LIST])
     try:
         sock.sendto(req, (ip, 47808))
         saved_timeout = sock.gettimeout()
@@ -784,7 +784,7 @@ def _read_object_names_sync(
             obj = objects[idx]
             obj_instance = obj["instance"]
             obj_type = obj["object_type"]
-            bvll = _build_read_property_request(obj_instance, BACNET_PROP_OBJECT_NAME, object_type=obj_type, invoke_id=(idx + 2) & 0xFF)
+            bvll = _build_read_property_multiple_request(obj_instance, [BACNET_PROP_OBJECT_NAME], object_type=obj_type, invoke_id=(idx + 2) & 0xFF)
 
             try:
                 sock.sendto(bvll, (ip, 47808))
