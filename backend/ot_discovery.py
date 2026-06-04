@@ -285,11 +285,16 @@ def _open_bacnet_udp_socket(local_ip: str, progress_cb: Callable[[int, str], Non
     ephemeral source port keeps the server responsive and still receives most
     direct I-Am replies because devices reply to the UDP source endpoint.
     """
+    # Prefer ephemeral ports.  On systems with an existing BACnet daemon
+    # (explorer, Wireshark, or a BMS stack) already bound to UDP 47808,
+    # SO_REUSEADDR lets us bind too, but the OS delivers most I-Am replies
+    # to the first-bound socket.  Using an ephemeral port avoids the
+    # conflict entirely — BACnet devices reply to the source endpoint.
     bind_candidates = [
-        (local_ip, 47808),
-        ("0.0.0.0", 47808),
         (local_ip, 0),
         ("0.0.0.0", 0),
+        (local_ip, 47808),
+        ("0.0.0.0", 47808),
     ]
     last_error: Exception | None = None
     for bind_addr in bind_candidates:
@@ -374,7 +379,7 @@ def _blocking_bacnet_discovery(
 
 
 async def _passive_bacnet_discovery(
-    timeout: float = 5.0,
+    timeout: float = 12.0,
     progress_cb: Callable[[int, str], None] | None = None,
     send_whois: bool = False,
 ) -> list[dict[str, Any]]:
@@ -395,7 +400,7 @@ async def _active_bacnet_read_property(device: dict[str, Any]) -> dict[str, Any]
 
 
 async def _full_bacnet_discovery(
-    timeout: float = 5.0,
+    timeout: float = 12.0,
     progress_cb: Callable[[int, str], None] | None = None,
 ) -> list[dict[str, Any]]:
     devices = await _passive_bacnet_discovery(
@@ -520,13 +525,13 @@ def _build_active_asset(ip: str, ports: list[int]) -> dict[str, Any]:
 
 
 async def _run_passive_scan(progress_cb: Callable[[int, str], None] | None = None) -> list[dict[str, Any]]:
-    devices = await _passive_bacnet_discovery(timeout=5.0, progress_cb=progress_cb, send_whois=False)
+    devices = await _passive_bacnet_discovery(timeout=12.0, progress_cb=progress_cb, send_whois=False)
     return [_build_bacnet_asset(d) for d in devices]
 
 
 async def _run_active_scan(progress_cb: Callable[[int, str], None] | None = None) -> list[dict[str, Any]]:
     # Safe active mode: start with BACnet discovery that is known to work.
-    devices = await _full_bacnet_discovery(timeout=5.0, progress_cb=progress_cb)
+    devices = await _full_bacnet_discovery(timeout=12.0, progress_cb=progress_cb)
     assets = [_build_bacnet_asset(d) for d in devices]
 
     # Optional lightweight TCP check only when discovery mode is "full".
