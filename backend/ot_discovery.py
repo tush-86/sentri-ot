@@ -284,33 +284,27 @@ def _build_read_property_multiple_request(
     invoke_id: int = 1,
     dnet: int = 200,
 ) -> bytes:
-    """Build a BACnet ReadPropertyMultiple Confirmed-Request.
+    """Build a YABE-compatible BACnet ReadProperty Confirmed-Request.
 
-    Backed by Wireshark capture of YABE against Siemens PXC controllers.
-    Key differences from our earlier attempts:
-      1. NPDU includes destination BACnet network (DNET) + MAC (DADR).
-         Siemens requires this; bare NPDU gets REJECT.
+    Matches Wireshark capture of YABE v4 against Siemens PXC controllers.
+    YABE uses ReadProperty (0x0C) even when reading multiple props — it sends
+    one property per request.  Key differences from raw BACnet spec:
+      1. NPDU includes destination BACnet network (DNET=200) + MAC (0x32).
       2. max-apdu = 117 (0x75, 1-byte constrained whole number).
-         YABE uses this value; larger 2-byte values alter byte alignment.
+      3. Single ReadProperty per call (YABE iterates).
     """
     obj_id = (object_type << 22) | (device_instance & 0x3FFFFF)
 
-    params = bytes([
-        0x0E,              # SEQUENCE OF opening (context 0)
-        0x0C,              # Object ID (context 0, len 4)
-    ]) + struct.pack("!I", obj_id) + bytes([
-        0x1E,              # list-of-props opening (context 1)
-    ])
-    for pid in property_ids:
-        params += bytes([0x09, pid])  # PropertyReference (context 0, len 1)
-    params += bytes([0x1F, 0x0F])   # closing tags
-
     apdu = bytes([
         0x02,              # PDU: Confirmed-Request, SA=1
-        0x75,              # max-apdu = 117 (match YABE, 1-byte encoding)
+        0x75,              # max-apdu = 117 (match YABE)
         invoke_id & 0xFF,
-        0x0E,              # ReadPropertyMultiple
-    ]) + params
+        0x0C,              # ReadProperty (YABE actually uses 0x0C, not 0x0E!)
+        0x0C,              # Object ID: context tag 0, len 4
+    ]) + struct.pack("!I", obj_id) + bytes([
+        0x19,              # Property ID: context tag 1, len 1
+        property_ids[0] & 0xFF if property_ids else 77,
+    ])
 
     # NPDU with destination BACnet network (Siemens PXC requirement)
     npdu = bytes([0x01, 0x24])  # version 1, dest present, expecting reply
@@ -663,18 +657,17 @@ def _enrich_device_sync(
         (BACNET_PROP_APPLICATION_SW_VERSION, "app_version"),
     ]
 
-    # Send one ReadPropertyMultiple for all properties
-    prop_ids = [p for p, _ in prop_reads]
-    req = _build_read_property_multiple_request(dev_id, prop_ids)
-    try:
-        sock.sendto(req, (ip, 47808))
-        saved = sock.gettimeout()
-        sock.settimeout(timeout)
-        data, _ = sock.recvfrom(4096)
-        sock.settimeout(saved)
-        results = _parse_read_property_multiple_ack(data, len(prop_ids))
-        for idx, (prop_id, field) in enumerate(prop_reads):
-            value = results[idx] if idx < len(results) else None
+    # Send one ReadProperty per property (YABE-compatible: individual
+    # ReadProperty calls, not batch ReadPropertyMultiple)
+    for prop_id, field in prop_reads:
+        req = _build_read_property_multiple_request(dev_id, [prop_id])
+        try:
+            sock.sendto(req, (ip, 47808))
+            saved = sock.gettimeout()
+            sock.settimeout(timeout)
+            data, _ = sock.recvfrom(4096)
+            sock.settimeout(saved)
+            value = _parse_read_property_ack(data)
             if value is not None and isinstance(value, str) and value.strip():
                 if field == "firmware":
                     enriched["firmware"] = value
@@ -692,19 +685,17 @@ def _enrich_device_sync(
                     if not enriched.get("firmware_version") or enriched["firmware_version"] == "Unknown":
                         enriched["firmware"] = value
                         enriched["firmware_version"] = value
-    except (OSError, socket.timeout):
-        pass
+        except (OSError, socket.timeout):
+            pass
 
-    # Read object-list count via ReadPropertyMultiple
     try:
         req = _build_read_property_multiple_request(dev_id, [BACNET_PROP_OBJECT_LIST])
         sock.sendto(req, (ip, 47808))
         saved = sock.gettimeout()
-        sock.settimeout(2.0)
+        sock.settimeout(3.0)
         data, _ = sock.recvfrom(4096)
         sock.settimeout(saved)
-        results = _parse_read_property_multiple_ack(data, 1)
-        obj_count = results[0] if results else None
+        obj_count = _parse_read_property_ack(data)
     except (OSError, socket.timeout):
         obj_count = None
 
