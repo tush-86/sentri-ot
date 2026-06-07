@@ -29,6 +29,27 @@ def _uuid4() -> str:
     return str(uuid.uuid4())
 
 
+def _normalize_asset_response(asset: dict[str, Any]) -> dict[str, Any]:
+    """Add desktop-friendly aliases while preserving DB column names."""
+    asset.setdefault("ip", asset.get("ip_address", ""))
+    asset.setdefault("vendor", asset.get("vendor_name", ""))
+    asset.setdefault("model", asset.get("device_type", ""))
+    asset.setdefault("firmware", asset.get("firmware_version", ""))
+    asset.setdefault("zone", asset.get("segmentation_zone", ""))
+    asset.setdefault("risk", asset.get("risk_level", ""))
+    if "device_id" not in asset and str(asset.get("id", "")).startswith("bacnet-"):
+        suffix = str(asset.get("id", ""))[7:]
+        if suffix.isdigit():
+            asset["device_id"] = int(suffix)
+    return asset
+
+
+def _normalize_alert_response(alert: dict[str, Any]) -> dict[str, Any]:
+    """Add desktop-friendly aliases while preserving DB column names."""
+    alert.setdefault("created_at", alert.get("timestamp", ""))
+    return alert
+
+
 # ── schema SQL ──────────────────────────────────────────────────────────────
 
 CREATE_SCANS_TABLE = """
@@ -285,7 +306,7 @@ async def get_latest_scan() -> Optional[dict[str, Any]]:
         asset = _row_to_dict(r)
         asset["ports"] = json.loads(asset.pop("ports_json", "[]"))
         asset["vulnerabilities"] = json.loads(asset.pop("vulnerabilities_json", "[]"))
-        scan["assets"].append(asset)
+        scan["assets"].append(_normalize_asset_response(asset))
 
     cur3 = await conn.execute(
         "SELECT * FROM alerts WHERE scan_id = ? AND status != 'Resolved' ORDER BY timestamp DESC", (scan_id,)
@@ -417,7 +438,7 @@ async def get_assets(
         asset = _row_to_dict(r)
         asset["ports"] = json.loads(asset.pop("ports_json", "[]"))
         asset["vulnerabilities"] = json.loads(asset.pop("vulnerabilities_json", "[]"))
-        items.append(asset)
+        items.append(_normalize_asset_response(asset))
 
     return {
         "items": items,
@@ -438,7 +459,7 @@ async def get_asset_by_id(asset_id: str) -> Optional[dict[str, Any]]:
     asset = _row_to_dict(row)
     asset["ports"] = json.loads(asset.pop("ports_json", "[]"))
     asset["vulnerabilities"] = json.loads(asset.pop("vulnerabilities_json", "[]"))
-    return asset
+    return _normalize_asset_response(asset)
 
 
 # ── alerts ──────────────────────────────────────────────────────────────────
@@ -477,7 +498,7 @@ async def get_alerts(
     rows = await cursor.fetchall()
 
     return {
-        "items": [_row_to_dict(r) for r in rows],
+        "items": [_normalize_alert_response(_row_to_dict(r)) for r in rows],
         "total": total,
         "page": page,
         "per_page": per_page,

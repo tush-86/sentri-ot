@@ -12,3 +12,7 @@ dist/
 *.log
 .openclaw/
 *.db-journal
+
+# Local runtime database
+sentri_ot.db
+*.db-journal

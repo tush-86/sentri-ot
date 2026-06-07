@@ -17,3 +17,6 @@ aiosqlite>=0.21.0
 
 # Optional: Modbus TCP (not needed for passive mode)
 # pymodbus>=3.9.0
+
+# Windows service wrapper
+pywin32>=306; sys_platform == "win32"

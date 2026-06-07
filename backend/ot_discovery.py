@@ -25,7 +25,6 @@ import os
 import random
 import socket
 import struct
-import subprocess
 import time
 import uuid
 from collections import Counter
@@ -277,320 +276,276 @@ BACNET_PROP_VENDOR_NAME = 121
 BACNET_PROP_APPLICATION_SW_VERSION = 12
 
 
+
+def _encode_context_unsigned(tag_number: int, value: int) -> bytes:
+    """Encode a BACnet context-tagged unsigned integer/object identifier."""
+    if value < 0:
+        raise ValueError("BACnet unsigned value cannot be negative")
+    if value <= 0xFF:
+        raw = value.to_bytes(1, "big")
+    elif value <= 0xFFFF:
+        raw = value.to_bytes(2, "big")
+    elif value <= 0xFFFFFF:
+        raw = value.to_bytes(3, "big")
+    else:
+        raw = value.to_bytes(4, "big")
+    if len(raw) <= 4:
+        return bytes([(tag_number << 4) | 0x08 | len(raw)]) + raw
+    return bytes([(tag_number << 4) | 0x08 | 0x05, len(raw)]) + raw
+
+
+def _build_read_property_request(
+    device_instance: int,
+    property_id: int,
+    object_type: int = BACNET_OBJECT_DEVICE,
+    object_instance: int | None = None,
+    invoke_id: int = 1,
+    array_index: int | None = None,
+) -> bytes:
+    """Build a standards-compliant BACnet/IP Confirmed-Request ReadProperty.
+
+    Packet layout:
+    - BVLC Original-Unicast-NPDU
+    - NPDU version 1, no destination/source
+    - APDU Confirmed-Request with segmented-response accepted and max APDU 480
+    - Service choice 0x0C (ReadProperty)
+    - objectIdentifier context tag 0, propertyIdentifier context tag 1,
+      optional arrayIndex context tag 2
+    """
+    instance = device_instance if object_instance is None else object_instance
+    obj_id = ((object_type & 0x3FF) << 22) | (int(instance) & 0x3FFFFF)
+
+    apdu = bytes([
+        0x04,              # Confirmed-Request-PDU, segmented response accepted
+        0x05,              # max-segments unspecified, max-APDU 480 octets
+        invoke_id & 0xFF,
+        0x0C,              # ReadProperty service choice
+        0x0C,              # context tag 0, length 4: Object Identifier
+    ]) + struct.pack("!I", obj_id) + _encode_context_unsigned(1, int(property_id))
+
+    if array_index is not None:
+        apdu += _encode_context_unsigned(2, int(array_index))
+
+    npdu = bytes([0x01, 0x00]) + apdu  # version 1, APDU follows, no DNET/SNET
+    return struct.pack("!BBH", 0x81, 0x0A, 4 + len(npdu)) + npdu
+
+
 def _build_read_property_multiple_request(
     device_instance: int,
     property_ids: list[int],
     object_type: int = BACNET_OBJECT_DEVICE,
     invoke_id: int = 1,
 ) -> bytes:
-    """Build a YABE-compatible BACnet ReadProperty Confirmed-Request.
+    """Backward-compatible wrapper.
 
-    Matches Wireshark capture of YABE v4 against Siemens PXC controllers.
-    YABE uses ReadProperty (0x0C) even when reading multiple props — it sends
-    one property per request.  Key differences from raw BACnet spec:
-      1. NPDU includes destination BACnet network (DNET=200) + MAC (0x32).
-      2. max-apdu = 117 (0x75, 1-byte constrained whole number).
-      3. Single ReadProperty per call (YABE iterates).
+    Older code used this name while actually issuing one ReadProperty request at
+    a time.  Keep the API but route to the corrected ReadProperty builder.
     """
-    obj_id = (object_type << 22) | (device_instance & 0x3FFFFF)
-
-    apdu = bytes([
-        0x02,              # PDU: Confirmed-Request, SA=1
-        0x75,              # max-apdu = 117 (match YABE)
-        invoke_id & 0xFF,
-        0x0C,              # ReadProperty (YABE actually uses 0x0C, not 0x0E!)
-        0x0C,              # Object ID: context tag 0, len 4
-    ]) + struct.pack("!I", obj_id) + bytes([
-        0x19,              # Property ID: context tag 1, len 1
-        property_ids[0] & 0xFF if property_ids else 77,
-    ])
-
-    # NPDU without destination (local network).  Siemens PXC controllers
-    # on the same BACnet segment accept this; only cross-network devices
-    # need DNET/DADR routing.  YABE uses local NPDU for same-subnet queries.
-    body = bytes([0x01, 0x00]) + apdu  # NPDU version 1, no dest
-    bvll = struct.pack("!BBH", 0x81, 0x0A, 4 + len(body)) + body
-    return bvll
+    prop_id = property_ids[0] if property_ids else BACNET_PROP_OBJECT_NAME
+    return _build_read_property_request(
+        device_instance=device_instance,
+        property_id=prop_id,
+        object_type=object_type,
+        invoke_id=invoke_id,
+    )
 
 
-def _parse_read_property_multiple_ack(data: bytes, expected_count: int = 1) -> list[str | int | None]:
-    """Parse Complex-ACK response from ReadPropertyMultiple.
+def _bacnet_apdu_from_bvll(data: bytes) -> bytes | None:
+    """Return the APDU bytes from a BACnet/IP BVLL packet."""
+    if len(data) < 7 or data[0] != 0x81:
+        return None
+    bvlc_len = int.from_bytes(data[2:4], "big")
+    if bvlc_len > len(data) or bvlc_len < 6:
+        return None
 
-    The response contains a list of ReadAccessResult, each containing
-    values for the requested properties. Returns one value per expected
-    property, or None for failures.
-    """
-    results: list[str | int | None] = [None] * expected_count
-    try:
-        if len(data) < 10 or data[0] != 0x81:
-            return results
-        bvlc_len = int.from_bytes(data[2:4], "big")
-        apdu = data[4:bvlc_len]
-        if len(apdu) < 4:
-            return results
+    # Forwarded-NPDU includes originating IP + port after the BVLC header.
+    pos = 10 if data[1] == 0x04 else 4
+    if pos + 2 > bvlc_len or data[pos] != 0x01:
+        return None
 
-        pdu_type = apdu[0] >> 4
-        if pdu_type not in (2, 3):  # SimpleACK or ComplexACK
-            return results
+    control = data[pos + 1]
+    pos += 2
 
-        if apdu[2] != 0x0E:  # must be ReadPropertyMultiple response
-            return results
+    if control & 0x20:  # destination specifier present
+        if pos + 3 > bvlc_len:
+            return None
+        dlen = data[pos + 2]
+        pos += 3 + dlen  # DNET(2), DLEN(1), DADR
+        if pos >= bvlc_len:
+            return None
+        pos += 1  # Hop count
 
-        # Skip PDU header: PDU(1) + invoke(1) + service(1) = 3 bytes
-        tail = apdu[3:]
+    if control & 0x08:  # source specifier present
+        if pos + 3 > bvlc_len:
+            return None
+        slen = data[pos + 2]
+        pos += 3 + slen  # SNET(2), SLEN(1), SADR
 
-        # Expect context tag 0 opening (0x0E) for SEQUENCE OF ReadAccessResult
-        if len(tail) < 1 or tail[0] != 0x0E:
-            return results
-        tail = tail[1:]
+    if control & 0x80:  # network layer message, not an APDU
+        return None
 
-        # Skip Object Identifier (context 0, len 4)
-        if len(tail) >= 5 and tail[0] == 0x0C:
-            tail = tail[5:]
-
-        # Context tag 1 opening (0x1E) for SEQUENCE OF ReadAccessPropertyResult
-        if len(tail) >= 1 and tail[0] == 0x1E:
-            tail = tail[1:]
-
-        idx = 0
-        while idx < expected_count and len(tail) > 1:
-            # Each property result starts with: context tag 3 (0x3E) opening or direct value
-            # The format is: opening tag 0x3E, then property id (context 0, len 1), then
-            # optional array index, then value in context tag 3
-            if tail[0] == 0x3E:
-                tail = tail[1:]
-                # Skip property ID (context 0, len 1): 0x09 + 1 byte
-                if len(tail) >= 2 and tail[0] == 0x09:
-                    tail = tail[2:]
-
-            # Now parse the property value
-            if len(tail) < 2:
-                break
-            value, consumed = _extract_bacnet_value(tail)
-            if value is not None:
-                results[idx] = value
-            if consumed > 0:
-                tail = tail[consumed:]
-            else:
-                tail = tail[1:]
-            idx += 1
-
-    except Exception:
-        pass
-    return results
+    if pos >= bvlc_len:
+        return None
+    return data[pos:bvlc_len]
 
 
-def _extract_bacnet_value(buf: bytes) -> tuple[str | int | None, int]:
-    """Extract a single BACnet value from a byte buffer.
-
-    Returns (value, bytes_consumed). Handles CharacterString,
-    Unsigned, Enumerated, and opening/closing tags.
-    """
-    if len(buf) < 2:
+def _decode_bacnet_tag_value(buf: bytes) -> tuple[str | int | dict[str, int] | list[dict[str, int]] | bytes | None, int]:
+    """Decode the BACnet application value at the start of *buf*."""
+    if not buf:
         return None, 0
     tag = buf[0]
     tag_number = (tag >> 4) & 0x0F
     is_context = bool(tag & 0x08)
     length_code = tag & 0x07
 
-    # Opening/closing tags
-    if length_code == 6:  # opening
-        return None, 1
-    if length_code == 7:  # closing
+    if length_code in (6, 7):  # opening/closing tag
         return None, 1
 
     pos = 1
-    length = length_code
     if length_code == 5:
         if pos >= len(buf):
             return None, 0
         length = buf[pos]
         pos += 1
-
-    if length <= 0 or pos + length > len(buf):
+    else:
+        length = length_code
+    if pos + length > len(buf):
         return None, 0
 
-    value_bytes = buf[pos:pos + length]
+    raw = buf[pos:pos + length]
     consumed = pos + length
 
     if is_context:
-        if tag_number == 0:  # property identifier
-            return int.from_bytes(value_bytes, "big"), consumed
-        elif tag_number == 3 and length == 4:  # object identifier
-            return int.from_bytes(value_bytes, "big"), consumed
-        elif tag_number in (2, 3):  # generic value - try as string first
-            try:
-                return value_bytes.decode("utf-8", errors="replace"), consumed
-            except Exception:
-                return value_bytes.hex(), consumed
-        elif tag_number == 1:  # array index
-            return int.from_bytes(value_bytes, "big"), consumed
-        return value_bytes.hex()[:16], consumed
+        return int.from_bytes(raw, "big") if raw else None, consumed
 
-    # Application tagged
     if tag_number == 7:  # CharacterString
-        if length > 1 and value_bytes[0] in (0, 4):
-            return value_bytes[1:].decode("utf-8" if value_bytes[0] == 4 else "ascii", errors="replace"), consumed
-        return value_bytes.decode("latin-1", errors="replace"), consumed
-    elif tag_number == 2:  # Unsigned
-        return int.from_bytes(value_bytes, "big"), consumed
-    elif tag_number == 9:  # Enumerated
-        return int.from_bytes(value_bytes, "big"), consumed
-    elif tag_number == 4:  # Real
-        if length == 4:
-            import struct as _st
-            try:
-                return round(_st.unpack(">f", value_bytes)[0], 2), consumed
-            except Exception:
-                pass
-        return None, consumed
-    elif tag_number in (12,):  # ObjectIdentifier
-        if length == 4:
-            raw = int.from_bytes(value_bytes, "big")
-            return {"object_type": (raw >> 22) & 0x3FF, "instance": raw & 0x3FFFFF}, consumed
-        return None, consumed
+        if not raw:
+            return "", consumed
+        encoding = raw[0]
+        payload = raw[1:]
+        if encoding == 0:
+            return payload.decode("latin-1", errors="replace"), consumed
+        if encoding == 4:
+            return payload.decode("utf-8", errors="replace"), consumed
+        if encoding == 3:
+            return payload.decode("utf-32-be", errors="replace"), consumed
+        if encoding == 5:
+            return payload.decode("utf-16-be", errors="replace"), consumed
+        return payload.decode("latin-1", errors="replace"), consumed
+    if tag_number in (2, 9):  # Unsigned / Enumerated
+        return int.from_bytes(raw, "big"), consumed
+    if tag_number == 12 and length == 4:  # ObjectIdentifier
+        obj_raw = int.from_bytes(raw, "big")
+        return {"object_type": (obj_raw >> 22) & 0x3FF, "instance": obj_raw & 0x3FFFFF}, consumed
+    if tag_number == 4 and length == 4:  # Real
+        try:
+            return round(struct.unpack("!f", raw)[0], 3), consumed
+        except Exception:
+            return raw, consumed
+    if tag_number == 1:  # Boolean, length code carries value
+        return bool(length_code), consumed
+    return raw.hex(), consumed
 
-    return value_bytes.hex()[:16], consumed
 
-
-def _parse_read_property_ack(data: bytes) -> str | int | None:
-    """Parse a BACnet Complex-ACK or Error response to ReadProperty.
-
-    Returns the decoded property value (str, int, or None on failure).
-    Handles the common BACnet data types used by Siemens controllers.
-
-    Simplified parser that extracts CharacterString and Unsigned values from
-    the Complex-ACK APDU without decoding every tag.
-    """
+def _parse_read_property_ack(data: bytes) -> str | int | dict[str, int] | list[dict[str, int]] | bytes | None:
+    """Parse a BACnet Complex-ACK response to ReadProperty."""
     try:
-        if len(data) < 10 or data[0] != 0x81:
-            return None
-
-        # BVLC + NPDU → find APDU start (after BVLC length)
-        bvlc_len = int.from_bytes(data[2:4], "big")
-        if bvlc_len > len(data):
-            return None
-
-        apdu_start = 4  # BVLC header is always 4 bytes
-        apdu = data[apdu_start:]
-
-        if len(apdu) < 4:
+        apdu = _bacnet_apdu_from_bvll(data)
+        if not apdu or len(apdu) < 3:
             return None
 
         pdu_type = apdu[0] >> 4
-        if pdu_type == 0x05:  # Error PDU
-            # Error class + error code follow invoke ID
-            if len(apdu) >= 5:
-                error_class = apdu[3]
-                error_code = apdu[4]
-                # PROPERTY_UNKNOWN = error_class 2, code 1
-                if error_class == 2:
-                    return None  # property not supported (expected for some)
+        if pdu_type == 5:  # Error PDU
+            return None
+        if pdu_type != 3:  # Complex-ACK
+            return None
+        if len(apdu) < 3 or apdu[2] != 0x0C:
             return None
 
-        if pdu_type not in (0x02, 0x03):  # Complex-ACK or Segmented-ACK
-            return None
+        tail = apdu[3:]  # invoke id + service choice already consumed
 
-        invoke_id = apdu[1]
-        svc = apdu[2]
-        if svc != 0x0C:  # must be ReadProperty response
-            return None
-
-        # After service choice: Object ID (context 0, len 4) → Property ID (context 1, len 1)
-        # → Opening tag for ReadProperty result (context 3, tag 0x3E)
-        # → Then the value depends on the data type
-
-        tail = apdu[3:]  # skip PDU type, invoke ID, service
-
-        # Skip Object Identifier (context tag 0, length 4) → 5 bytes
+        # Skip objectIdentifier context tag 0.
         if len(tail) >= 5 and tail[0] == 0x0C:
             tail = tail[5:]
-
-        # Skip Property Identifier (context tag 1, length 1) → 2 bytes
-        if len(tail) >= 2 and tail[0] == 0x19:
-            tail = tail[2:]
-
-        # ReadProperty result: context tag 3 opening tag (0x3E) or context tag 3 with value
-        if len(tail) < 1:
-            return None
-
-        # Opening tag 0x3E → skip, then expect a value tag
-        if tail[0] == 0x3E:
-            tail = tail[1:]
-
-        if len(tail) < 2:
-            return None
-
-        tag = tail[0]
-        tag_number = (tag >> 4) & 0x0F
-        tag_class_bit = tag & 0x08
-        length_code = tag & 0x07
-
-        # Ignore another opening tag
-        if tag == 0x2E:  # context tag 2 opening
-            tail = tail[1:]
-            if len(tail) < 2:
-                return None
-            tag = tail[0]
-            tag_number = (tag >> 4) & 0x0F
-            length_code = tag & 0x07
-
-        pos = 1
-        length = length_code
-        if length_code == 5:  # extended length
-            if pos >= len(tail):
-                return None
-            length = tail[pos]
-            pos += 1
-        if length <= 0 or pos + length > len(tail):
-            return None
-
-        value_bytes = tail[pos:pos + length]
-
-        # Determine data type from tag
-        if tag_class_bit == 0:
-            app_tag = tag_number
         else:
-            # Context-specific — the expected type depends on the property
-            # For properties we query:
-            #   firmware/model/vendor/object-name → CharacterString (app tag 7)
-            #   object-list → BACnetARRAY (opening) of ObjectIdentifiers
-            app_tag = 7  # default to CharacterString for these properties
-
-        if app_tag == 7:  # CharacterString
-            # First byte is encoding: 0=ANSI X3.4, 4=ISO 10646 (UCS-2/UTF-16BE)
-            if length > 0:
-                encoding = value_bytes[0]
-                if length > 1:
-                    if encoding == 0:  # ASCII/ANSI
-                        return value_bytes[1:].decode("ascii", errors="replace")
-                    elif encoding in (4, 5):  # UTF-8 or ISO 10646
-                        return value_bytes[1:].decode("utf-8", errors="replace")
-                    else:
-                        return value_bytes[1:].decode("latin-1", errors="replace")
-                return ""
             return None
-        elif app_tag == 2:  # Unsigned
-            return int.from_bytes(value_bytes, "big")
-        elif app_tag == 9:  # Enumerated
-            return int.from_bytes(value_bytes, "big")
-        elif app_tag == 12:  # ObjectIdentifier
-            # For object-list items: 4-byte encoded (type<<22 | instance)
-            if length == 4:
-                raw = int.from_bytes(value_bytes, "big")
-                obj_type = (raw >> 22) & 0x3FF
-                obj_instance = raw & 0x3FFFFF
-                return {"object_type": obj_type, "instance": obj_instance}
+
+        # Skip propertyIdentifier context tag 1 (length may be 1/2/4).
+        if not tail or ((tail[0] >> 4) & 0x0F) != 1 or not (tail[0] & 0x08):
             return None
-        elif tag == 0x3E or tag == 0x0E:  # Opening tag for array/list
-            # Return a count marker so caller knows there are objects
-            return "<array>"
+        _, consumed = _decode_bacnet_tag_value(tail)
+        if consumed <= 0:
+            return None
+        tail = tail[consumed:]
 
-        # Fallback: return raw value as hex
-        return value_bytes.hex() if len(value_bytes) <= 16 else f"{len(value_bytes)} bytes"
+        # Optional array index context tag 2.
+        if tail and ((tail[0] >> 4) & 0x0F) == 2 and (tail[0] & 0x08):
+            _, consumed = _decode_bacnet_tag_value(tail)
+            if consumed > 0:
+                tail = tail[consumed:]
 
+        # Result is wrapped in context tag 3 opening/closing: 0x3E ... 0x3F.
+        if tail and tail[0] == 0x3E:
+            tail = tail[1:]
+        if not tail:
+            return None
+
+        # Object_List often returns multiple ObjectIdentifier values; collect them.
+        objects: list[dict[str, int]] = []
+        pos = 0
+        while pos < len(tail):
+            if tail[pos] == 0x3F:  # closing tag 3
+                break
+            value, consumed = _decode_bacnet_tag_value(tail[pos:])
+            if consumed <= 0:
+                pos += 1
+                continue
+            if isinstance(value, dict) and "object_type" in value:
+                objects.append(value)
+                pos += consumed
+                continue
+            if objects:
+                break
+            return value
+        if objects:
+            return objects
+        return None
     except Exception:
         return None
+def _read_property_with_socket(
+    sock: socket.socket,
+    ip: str,
+    device_instance: int,
+    property_id: int,
+    object_type: int = BACNET_OBJECT_DEVICE,
+    object_instance: int | None = None,
+    invoke_id: int = 1,
+    timeout: float = 2.0,
+) -> Any:
+    """Send one ReadProperty request over an existing UDP socket."""
+    req = _build_read_property_request(
+        device_instance=device_instance,
+        property_id=property_id,
+        object_type=object_type,
+        object_instance=object_instance,
+        invoke_id=invoke_id,
+    )
+    try:
+        sock.sendto(req, (ip, 47808))
+        saved = sock.gettimeout()
+        sock.settimeout(timeout)
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                data, _ = sock.recvfrom(8192)
+                value = _parse_read_property_ack(data)
+                if value is not None:
+                    return value
+        finally:
+            sock.settimeout(saved)
+    except (OSError, socket.timeout):
+        return None
+    return None
 
 
 def _read_property_sync(
@@ -599,35 +554,54 @@ def _read_property_sync(
     device_instance: int,
     property_id: int,
     timeout: float = 2.0,
-) -> str | int | None:
-    """Send ReadProperty and parse the Complex-ACK response."""
-    req = _build_read_property_multiple_request(device_instance, [property_id])
-    try:
-        sock.sendto(req, (ip, 47808))
-        saved = sock.gettimeout()
-        sock.settimeout(timeout)
+) -> Any:
+    """Backward-compatible helper used by legacy enrichment paths."""
+    return _read_property_with_socket(sock, ip, device_instance, property_id, timeout=timeout)
+
+
+def read_bacnet_property(
+    ip: str,
+    device_instance: int,
+    property_id: int,
+    object_type: int = BACNET_OBJECT_DEVICE,
+    object_instance: int | None = None,
+    timeout: float = 2.0,
+    local_ip: str | None = None,
+) -> Any:
+    """Public BACnet ReadProperty helper for API/UI diagnostics.
+
+    Opens a short-lived UDP socket, sends a standards-compliant BACnet/IP
+    ReadProperty request, and returns the decoded Complex-ACK value.  This is
+    intentionally synchronous so it can be used from worker threads or wrapped
+    with asyncio.to_thread() by FastAPI endpoints.
+    """
+    bind_ip = local_ip or _local_bacnet_ip()
+    last_error: Exception | None = None
+    for candidate in (bind_ip, "0.0.0.0", ""):
+        sock: socket.socket | None = None
         try:
-            data, _ = sock.recvfrom(4096)
-            if len(data) < 10:
-                return None
-            # Quick BVLC sniff: expected type 0x81 func 0x0A
-            if data[0] != 0x81 or data[1] != 0x0A:
-                return None
-            # Check for Error PDU (0x50) vs Complex-ACK (0x30)
-            bvlc_len = int.from_bytes(data[2:4], "big")
-            apdu_start = 4
-            if apdu_start < bvlc_len and apdu_start < len(data):
-                pdu_type = data[apdu_start] >> 4
-                if pdu_type == 0x05:  # Error
-                    err_cls = data[apdu_start + 3] if apdu_start + 3 < len(data) else 0
-                    err_code = data[apdu_start + 4] if apdu_start + 4 < len(data) else 0
-                    if err_cls == 2 and err_code == 1:  # unknown-property
-                        return None  # device doesn't support this property
-            return _parse_read_property_ack(data)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((candidate, 0) if candidate else ("", 0))
+            return _read_property_with_socket(
+                sock=sock,
+                ip=ip,
+                device_instance=int(device_instance),
+                property_id=int(property_id),
+                object_type=int(object_type),
+                object_instance=int(object_instance) if object_instance is not None else None,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            last_error = exc
         finally:
-            sock.settimeout(saved)
-    except (OSError, socket.timeout):
-        return None
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+    raise RuntimeError(f"Could not open BACnet UDP socket for ReadProperty: {last_error}")
 
 
 def _enrich_device_sync(
@@ -657,59 +631,30 @@ def _enrich_device_sync(
     # Send one ReadProperty per property (YABE-compatible: individual
     # ReadProperty calls, not batch ReadPropertyMultiple)
     for prop_id, field in prop_reads:
-        req = _build_read_property_multiple_request(dev_id, [prop_id])
-        try:
-            sock.sendto(req, (ip, 47808))
-            saved = sock.gettimeout()
-            sock.settimeout(timeout)
-            # Loop: skip unrelated BACnet traffic until we get our response
-            deadline = time.monotonic() + timeout
-            value = None
-            while time.monotonic() < deadline:
-                try:
-                    data, _ = sock.recvfrom(4096)
-                    value = _parse_read_property_ack(data)
-                    if value is not None:
-                        break
-                except socket.timeout:
-                    break
-            sock.settimeout(saved)
-            if value is not None and isinstance(value, str) and value.strip():
-                if field == "firmware":
+        value = _read_property_with_socket(sock, ip, int(dev_id), prop_id, timeout=timeout)
+        if value is not None and isinstance(value, str) and value.strip():
+            if field == "firmware":
+                enriched["firmware"] = value
+                enriched["firmware_version"] = value
+            elif field == "model":
+                enriched["model"] = value
+                enriched["device_type"] = value
+            elif field == "name":
+                enriched["name"] = value
+                enriched["hostname"] = value
+            elif field == "vendor":
+                enriched["vendor"] = value
+                enriched["vendor_name"] = value
+            elif field == "app_version":
+                if not enriched.get("firmware_version") or enriched["firmware_version"] == "Unknown":
                     enriched["firmware"] = value
                     enriched["firmware_version"] = value
-                elif field == "model":
-                    enriched["model"] = value
-                    enriched["device_type"] = value
-                elif field == "name":
-                    enriched["name"] = value
-                    enriched["hostname"] = value
-                elif field == "vendor":
-                    enriched["vendor"] = value
-                    enriched["vendor_name"] = value
-                elif field == "app_version":
-                    if not enriched.get("firmware_version") or enriched["firmware_version"] == "Unknown":
-                        enriched["firmware"] = value
-                        enriched["firmware_version"] = value
-        except (OSError, socket.timeout):
-            pass
 
-    try:
-        req = _build_read_property_multiple_request(dev_id, [BACNET_PROP_OBJECT_LIST])
-        sock.sendto(req, (ip, 47808))
-        saved = sock.gettimeout()
-        sock.settimeout(3.0)
-        data, _ = sock.recvfrom(4096)
-        sock.settimeout(saved)
-        obj_count = _parse_read_property_ack(data)
-    except (OSError, socket.timeout):
-        obj_count = None
-
-    if obj_count is not None:
-        if isinstance(obj_count, int):
-            enriched["object_count"] = obj_count
-        elif isinstance(obj_count, str) and obj_count == "<array>":
-            enriched["object_count"] = -1  # marker: array received, count unknown
+    obj_list = _read_property_with_socket(sock, ip, int(dev_id), BACNET_PROP_OBJECT_LIST, timeout=3.0)
+    if isinstance(obj_list, list):
+        enriched["object_count"] = len(obj_list)
+    elif isinstance(obj_list, int):
+        enriched["object_count"] = obj_list
 
     return enriched
 
@@ -730,84 +675,34 @@ def _read_object_names_sync(
     """
     objects: list[dict[str, Any]] = []
 
-    # Step 1: read the first chunk of the object-list
-    # Most controllers return the array opening tag with elements inline.
-    # We read the raw response and look for ObjectIdentifier values.
-    req = _build_read_property_multiple_request(device_instance, [BACNET_PROP_OBJECT_LIST])
+    # Step 1: read object-list and collect ObjectIdentifier values.
     try:
-        sock.sendto(req, (ip, 47808))
-        saved_timeout = sock.gettimeout()
-        sock.settimeout(timeout)
-        try:
-            data, _ = sock.recvfrom(4096)
-        finally:
-            sock.settimeout(saved_timeout)
-
-        if len(data) < 14 or data[0] != 0x81:
-            return objects
-
-        # Walk the Complex-ACK looking for ObjectIdentifier values (context 0, len 4)
-        # that appear after the array opening tag
-        bvlc_len = int.from_bytes(data[2:4], "big")
-        apdu = data[4:bvlc_len]  # APDU is within BVLC length
-        if len(apdu) < 10:
-            return objects
-
-        pos = 3  # skip PDU type, invoke ID, service choice
-
-        # Skip obj id (0x0C + 4) and prop id (0x19 + 1)
-        skipped = 0
-        while pos < len(apdu) - 1 and skipped < 2:
-            if apdu[pos] == 0x0C and pos + 5 <= len(apdu):
-                pos += 5
-                skipped += 1
-            elif apdu[pos] == 0x19 and pos + 2 <= len(apdu):
-                pos += 2
-                skipped += 1
-            elif apdu[pos] in (0x3E, 0x2E, 0x0E):  # opening tags
-                pos += 1
-                skipped += 1
-            else:
-                pos += 1
-
-        # Now scan for ObjectIdentifier entries: 0x0C + 4 bytes
-        while pos + 5 <= len(apdu) and len(objects) < max_objects:
-            if apdu[pos] == 0x0C:
-                raw = int.from_bytes(apdu[pos + 1:pos + 5], "big")
-                obj_type = (raw >> 22) & 0x3FF
-                obj_instance = raw & 0x3FFFFF
-                # Only include non-Device objects in the child list
+        obj_list = _read_property_with_socket(
+            sock, ip, int(device_instance), BACNET_PROP_OBJECT_LIST, timeout=timeout
+        )
+        if isinstance(obj_list, list):
+            for item in obj_list[:max_objects]:
+                obj_type = int(item.get("object_type", BACNET_OBJECT_DEVICE))
+                obj_instance = int(item.get("instance", 0))
                 if obj_type != BACNET_OBJECT_DEVICE:
-                    objects.append({
-                        "object_type": obj_type,
-                        "instance": obj_instance,
-                        "name": None,
-                    })
-                pos += 5
-            else:
-                pos += 1
+                    objects.append({"object_type": obj_type, "instance": obj_instance, "name": None})
 
         # Step 2: read names for a subset of objects (first 20)
         name_budget = min(20, len(objects))
         for idx in range(name_budget):
             obj = objects[idx]
-            obj_instance = obj["instance"]
-            obj_type = obj["object_type"]
-            bvll = _build_read_property_multiple_request(obj_instance, [BACNET_PROP_OBJECT_NAME], object_type=obj_type, invoke_id=(idx + 2) & 0xFF)
-
-            try:
-                sock.sendto(bvll, (ip, 47808))
-                saved = sock.gettimeout()
-                sock.settimeout(1.0)
-                try:
-                    resp, _ = sock.recvfrom(1024)
-                    name = _parse_read_property_ack(resp)
-                    if isinstance(name, str) and name.strip():
-                        objects[idx]["name"] = name
-                finally:
-                    sock.settimeout(saved)
-            except (OSError, socket.timeout):
-                pass
+            name = _read_property_with_socket(
+                sock,
+                ip,
+                int(device_instance),
+                BACNET_PROP_OBJECT_NAME,
+                object_type=int(obj["object_type"]),
+                object_instance=int(obj["instance"]),
+                invoke_id=(idx + 2) & 0xFF,
+                timeout=1.0,
+            )
+            if isinstance(name, str) and name.strip():
+                objects[idx]["name"] = name
 
     except (OSError, socket.timeout):
         pass

@@ -8,15 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import uuid
 from datetime import datetime, timezone
+
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from starlette.responses import FileResponse
 
 from backend.db import (
     init_db,
@@ -35,12 +37,12 @@ from backend.db import (
     prune_old_data,
     close_db,
 )
-from backend.ot_discovery import scan_environment_async
+from backend.ot_discovery import BACNET_OBJECT_DEVICE, read_bacnet_property, scan_environment_async
 from backend.report_gen import generate_pdf_report
 
 # ── configuration from env ──────────────────────────────────────────────────
 
-BACKEND_VERSION = "0.2.0"
+BACKEND_VERSION = "0.3.0-windows"
 SCAN_MODE = os.environ.get("SENTRI_OT_SCAN_MODE", "passive")
 SCAN_INTERVAL_MINUTES = int(os.environ.get("SENTRI_OT_SCAN_INTERVAL", "60"))
 SCAN_NETWORKS = os.environ.get("SENTRI_OT_SCAN_NETWORKS", "")
@@ -352,10 +354,12 @@ async def latest_alerts_endpoint() -> dict[str, Any]:
 async def list_assets(
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=500),
+    page_size: Optional[int] = Query(None, ge=1, le=500),
     search: Optional[str] = None,
     device_type: Optional[str] = None,
     protocol: Optional[str] = None,
     segmentation_zone: Optional[str] = None,
+    zone: Optional[str] = None,
     criticality: Optional[str] = None,
     risk_level: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -367,6 +371,8 @@ async def list_assets(
         filters["device_type"] = device_type
     if protocol:
         filters["protocol"] = protocol
+    if zone and not segmentation_zone:
+        segmentation_zone = zone
     if segmentation_zone:
         filters["segmentation_zone"] = segmentation_zone
     if criticality:
@@ -374,7 +380,7 @@ async def list_assets(
     if risk_level:
         filters["risk_level"] = risk_level
 
-    return await get_assets(filters=filters or None, page=page, per_page=per_page)
+    return await get_assets(filters=filters or None, page=page, per_page=page_size or per_page)
 
 
 @app.get("/api/devices")
@@ -424,7 +430,7 @@ async def list_alerts(
     if severity:
         filters["severity"] = severity
     if status:
-        filters["status"] = status
+        filters["status"] = "Active" if status.lower() == "open" else status
     if asset_id:
         filters["asset_id"] = asset_id
 
@@ -432,6 +438,7 @@ async def list_alerts(
 
 
 @app.put("/api/alerts/{alert_id}/acknowledge")
+@app.post("/api/alerts/{alert_id}/acknowledge")
 async def ack_alert(alert_id: str) -> dict[str, Any]:
     """Acknowledge an active alert."""
     ok = await acknowledge_alert(alert_id)
@@ -441,6 +448,7 @@ async def ack_alert(alert_id: str) -> dict[str, Any]:
 
 
 @app.put("/api/alerts/{alert_id}/resolve")
+@app.post("/api/alerts/{alert_id}/resolve")
 async def resolve_alert_endpoint(alert_id: str) -> dict[str, Any]:
     """Resolve an alert."""
     ok = await resolve_alert(alert_id)
@@ -503,6 +511,62 @@ async def compliance_overview_legacy() -> dict[str, Any]:
     return await compliance_latest()
 
 
+@app.get("/api/compliance")
+async def compliance_for_desktop(framework: Optional[str] = None) -> dict[str, Any]:
+    """Desktop-app friendly compliance endpoint.
+
+    Returns the full latest compliance object, optionally narrowed to a named
+    framework while preserving a predictable wrapper shape.
+    """
+    data = await compliance_latest()
+    if not framework:
+        return data
+    frameworks = data.get("frameworks", {}) if isinstance(data, dict) else {}
+    selected = frameworks.get(framework) or frameworks.get("IEC 62443" if framework.upper().startswith("IEC") else framework)
+    return {
+        "framework": framework,
+        "score": selected.get("score", data.get("score", 0)) if isinstance(selected, dict) else data.get("score", 0),
+        "rating": data.get("rating", ""),
+        "data": selected or {},
+        "generated_at": data.get("generated_at"),
+    }
+
+
+@app.get("/api/read-property")
+async def read_property_endpoint(
+    ip: str,
+    device_instance: int,
+    property_id: int,
+    object_type: int = BACNET_OBJECT_DEVICE,
+    object_instance: Optional[int] = None,
+    timeout: float = Query(2.0, ge=0.2, le=15.0),
+) -> dict[str, Any]:
+    """Read one BACnet property from a controller for desktop diagnostics."""
+    from backend.ot_discovery import BACNET_OBJECT_DEVICE
+
+    try:
+        value = await asyncio.to_thread(
+            read_bacnet_property,
+            ip,
+            device_instance,
+            property_id,
+            object_type,
+            object_instance,
+            timeout,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ReadProperty failed: {exc}") from exc
+    return {
+        "ip": ip,
+        "device_instance": device_instance,
+        "object_type": object_type,
+        "object_instance": object_instance,
+        "property_id": property_id,
+        "value": value,
+        "status": "ok" if value is not None else "no_response",
+    }
+
+
 @app.get("/api/compliance/frameworks")
 async def compliance_frameworks() -> dict[str, list[dict[str, Any]]]:
     """List supported compliance frameworks."""
@@ -555,7 +619,8 @@ async def compliance_controls(framework: str = Query("DESC")) -> dict[str, Any]:
 
 
 @app.get("/api/report/pdf")
-async def report_pdf() -> Response:
+@app.get("/api/reports/compliance/{scan_id}")
+async def report_pdf(scan_id: Optional[str] = None) -> Response:
     """Download PDF report."""
     scan = await get_latest_scan()
     if scan is None:
@@ -630,36 +695,28 @@ async def update_config(config: dict[str, Any]) -> dict[str, Any]:
     return await get_config()
 
 
-# ── serve frontend static files ────────────────────────────────────────────
+# ── API-only root ────────────────────────────────────────────────────────────
 
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.dirname(BACKEND_DIR)
-FRONTEND_DIST_CANDIDATES = [
-    os.path.join(PROJECT_DIR, "frontend", "dist"),  # bare-metal/source checkout
-    os.path.join(BACKEND_DIR, "static"),             # Docker image copy target
-]
-FRONTEND_DIST = next((path for path in FRONTEND_DIST_CANDIDATES if os.path.isdir(path)), "")
-if FRONTEND_DIST:
-    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
 
-    @app.get("/")
-    async def serve_frontend() -> FileResponse:
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+@app.get("/")
+async def root() -> dict[str, Any]:
+    """API-only backend root. The Windows desktop app replaces the web UI."""
+    return {
+        "service": "Sentri OT",
+        "version": BACKEND_VERSION,
+        "mode": "api-only",
+        "desktop_app": "windows_app",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
 
-    @app.exception_handler(404)
-    async def spa_fallback(request, exc):
-        path = request.url.path
-        if path.startswith("/api/") or path.startswith("/docs") or path.startswith("/openapi"):
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"detail": "Not Found"}, status_code=404)
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
-else:
-    @app.get("/")
-    async def root() -> dict[str, Any]:
-        return {
-            "service": "Sentri OT",
-            "version": BACKEND_VERSION,
-            "scan_mode": SCAN_MODE,
-            "docs": "/docs",
-            "health": "/api/health",
-        }
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "backend.main:app",
+        host=os.environ.get("SENTRI_OT_HOST", "127.0.0.1"),
+        port=int(os.environ.get("SENTRI_OT_PORT", "8000")),
+        reload=False,
+    )
